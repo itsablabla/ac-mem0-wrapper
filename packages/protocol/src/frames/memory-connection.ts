@@ -1,0 +1,274 @@
+import { z } from 'zod'
+import {
+  MEMORY_PLUGIN_PROFILE,
+  MEMORY_RECALL_DEFAULTS,
+  MEMORY_RECALL_HARD_LIMITS,
+  MemoryPluginManifest
+} from '../memory-plugin.js'
+
+/**
+ * External-memory control-plane distribution (M-5A).
+ *
+ * The Control Plane owns installations and org connections. A daemon receives
+ * a transport-specific private definition. Remote definitions carry a relay URL
+ * and purpose-specific bearer grant; local definitions carry an operator
+ * allowlist reference and daemon-private secret lease. Raw local commands never
+ * cross this wire.
+ */
+
+export const MemoryRecallPolicy = z
+  .object({
+    mode: z.enum(['auto', 'tool-only']).default('auto'),
+    topK: z.number().int().positive().max(MEMORY_RECALL_HARD_LIMITS.topK).default(MEMORY_RECALL_DEFAULTS.topK),
+    maxBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(MEMORY_RECALL_HARD_LIMITS.maxBytes)
+      .default(MEMORY_RECALL_DEFAULTS.maxBytes),
+    timeoutMs: z
+      .number()
+      .int()
+      .positive()
+      .max(MEMORY_RECALL_HARD_LIMITS.timeoutMs)
+      .default(MEMORY_RECALL_DEFAULTS.timeoutMs)
+  })
+  .strict()
+export type MemoryRecallPolicy = z.infer<typeof MemoryRecallPolicy>
+
+export const MemoryCapturePolicy = z.object({ mode: z.enum(['turn', 'manual']).default('manual') }).strict()
+export type MemoryCapturePolicy = z.infer<typeof MemoryCapturePolicy>
+
+/**
+ * Dreaming — periodic offline consolidation of the MANAGED store
+ * (design: docs/designs/memory-dreaming.md). Valid only with
+ * `provider: 'managed'`; the daemon stages a rebuilt store per dream and the
+ * user reviews and adopts it, or an enabled auto-accept policy adopts it.
+ * Bounds mirror the design: sessionWindow ≤ 100 mined transcripts,
+ * instructions ≤ 4096 chars.
+ */
+export const MemoryDreamingPolicy = z
+  .object({
+    enabled: z.boolean(),
+    /** Optional override pinning a fixed newest-N session window to mine. When
+     *  absent (the norm), the daemon sizes the window automatically — every
+     *  session active since the last successful dream, capped at 100 — so this
+     *  normally needs no configuration. */
+    sessionWindow: z.number().int().min(1).max(100).optional(),
+    /** Cron expression for scheduled dreams (same syntax as agent crons). A tick
+     *  that lands while a dream is already in flight is skipped, not queued. */
+    schedule: z.string().min(1).max(128).optional(),
+    /** IANA zone the `schedule` is evaluated in (as on agent crons). Absent ⇒ the
+     *  daemon host's local time. */
+    timezone: z.string().min(1).max(64).optional(),
+    /** Operator steering text applied through the whole dream pipeline. */
+    instructions: z.string().max(4096).optional(),
+    /** Also mine reusable procedures into candidate skills (never auto-installed —
+     *  a mined skill is always a proposal that needs explicit approval). Absent
+     *  defaults to true; false is the opt-out. */
+    mineSkills: z.boolean().optional(),
+    /** Adopt the staged store automatically on completion without content
+     *  review. Live-memory fence conflicts remain reviewable. Absent defaults
+     *  to true for effective managed-memory policies; false is the opt-out. */
+    autoAdopt: z.boolean().optional()
+  })
+  .strict()
+export type MemoryDreamingPolicy = z.infer<typeof MemoryDreamingPolicy>
+
+/** Product default for managed memory with no explicit dreaming policy.
+ *
+ * The schedule is evaluated in the daemon host's timezone because no timezone
+ * is set. Keeping this as an explicit policy lets a saved policy distinguish
+ * manual-only dreaming (enabled with no schedule) from the default daily run.
+ */
+export const DEFAULT_MEMORY_DREAMING_POLICY = {
+  enabled: true,
+  schedule: '0 4 * * *',
+  // By default a completed dream is adopted without review and reusable procedures
+  // are mined into candidate skills. Adoption is text-only and reversible; mined
+  // skills are still proposals that need explicit approval before install (they are
+  // executable), so mining-on only surfaces candidates.
+  autoAdopt: true,
+  mineSkills: true
+} as const satisfies MemoryDreamingPolicy
+
+/** Retired: memory is layered by audience for every agent, so a stored `scope` is accepted and never read. */
+export const ManagedMemoryScope = z.enum(['agent', 'channel'])
+export type ManagedMemoryScope = z.infer<typeof ManagedMemoryScope>
+
+/** Where a managed tree lives (memory-evolution.md §3.2.1): the daemon's disk, or the Control Plane database. */
+export const ManagedMemoryHome = z.enum(['daemon', 'control-plane'])
+export type ManagedMemoryHome = z.infer<typeof ManagedMemoryHome>
+
+export const ManagedMemoryBinding = z
+  .object({
+    provider: z.literal('managed'),
+    autoDistill: z.boolean().optional(),
+    dreaming: MemoryDreamingPolicy.optional(),
+    scope: ManagedMemoryScope.optional(),
+    // Absent on a binding older than the field ⇒ `daemon`, the historical home; the CP stores the resolved value.
+    home: ManagedMemoryHome.default('daemon'),
+    // CP-owned: set with a `daemon` → `control-plane` change, cleared by `memory/home/migrated`; never accepted from a client.
+    homeMigration: z.literal('pending').optional()
+  })
+  .strict()
+export type ManagedMemoryBinding = z.infer<typeof ManagedMemoryBinding>
+
+// `none` and `native` carry no managed policy; `autoDistill` stays accepted because stored bindings have carried it.
+export const RuntimeMemoryBinding = z
+  .object({ provider: z.enum(['none', 'native']), autoDistill: z.boolean().optional() })
+  .strict()
+export type RuntimeMemoryBinding = z.infer<typeof RuntimeMemoryBinding>
+
+export const ExternalMemoryBinding = z
+  .object({
+    provider: z.literal('external'),
+    connectionId: z.string().uuid(),
+    recall: MemoryRecallPolicy.default({ mode: 'auto', ...MEMORY_RECALL_DEFAULTS }),
+    // The safe default never exports a full turn. Console users must explicitly
+    // acknowledge the egress disclosure before selecting turn capture.
+    capture: MemoryCapturePolicy.default({ mode: 'manual' })
+  })
+  .strict()
+export type ExternalMemoryBinding = z.infer<typeof ExternalMemoryBinding>
+
+/** Agent-facing provider selection. External bindings carry policy, never endpoints or secrets. */
+export const AgentMemoryBinding = z.union([ManagedMemoryBinding, RuntimeMemoryBinding, ExternalMemoryBinding])
+export type AgentMemoryBinding = z.infer<typeof AgentMemoryBinding>
+
+/** Resolve the managed-memory dreaming policy used by the daemon.
+ *
+ * No memory binding means the managed provider, and no explicit dreaming policy
+ * means the daily product default. Once a policy exists its absent schedule
+ * remains meaningful (manual-only), while absent `autoAdopt` and `mineSkills`
+ * normalize to the product default (true); an explicit false is the opt-out.
+ */
+export function effectiveMemoryDreamingPolicy(
+  binding: AgentMemoryBinding | undefined
+): MemoryDreamingPolicy | undefined {
+  if (binding && binding.provider !== 'managed') return undefined
+  const policy = binding?.dreaming
+  if (!policy) return { ...DEFAULT_MEMORY_DREAMING_POLICY }
+  return { ...policy, autoAdopt: policy.autoAdopt ?? true, mineSkills: policy.mineSkills ?? true }
+}
+
+/** Reviewed mapping from a logical secret field to the header the relay injects. */
+export const MemoryPluginSecretHeaderPin = z
+  .object({ name: z.string().min(1).max(128), header: z.string().min(1).max(128), required: z.boolean() })
+  .strict()
+export type MemoryPluginSecretHeaderPin = z.infer<typeof MemoryPluginSecretHeaderPin>
+
+export const MemoryPluginPin = z
+  .object({
+    pluginId: z.string().min(1).max(255),
+    profileMajor: z.literal(1),
+    manifestDigest: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    secretHeaders: z.array(MemoryPluginSecretHeaderPin).max(64).default([])
+  })
+  .strict()
+export type MemoryPluginPin = z.infer<typeof MemoryPluginPin>
+
+const MemoryConnectionSpecBase = z
+  .object({
+    orgId: z.string().min(1).max(64).optional(),
+    connectionId: z.string().uuid(),
+    revision: z.number().int().positive(),
+    config: z.record(z.string(), z.unknown()),
+    secretKeys: z.array(z.string().min(1).max(128)).max(64).default([]),
+    pin: MemoryPluginPin
+  })
+  .strict()
+
+const RemoteMemoryConnectionSpec = MemoryConnectionSpecBase.extend({
+  transport: z.literal('streamable-http'),
+  relayUrl: z.string().url(),
+  grantKey: z.string().min(1).max(512)
+}).strict()
+
+/** Plaintext values cross only the authenticated daemon control channel and
+ * remain in its private registry until they are injected into the allowlisted
+ * plugin child. They never enter AgentSpec, agent.json, or the agent runtime. */
+export const MemoryConnectionSecretLease = z
+  .object({
+    values: z.record(
+      z.string().min(1).max(128),
+      z
+        .string()
+        .min(1)
+        .max(16 * 1024)
+        .refine((value) => !value.includes('\0'), 'memory connection secret contains NUL')
+    )
+  })
+  .strict()
+  .superRefine((lease, ctx) => {
+    if (new TextEncoder().encode(JSON.stringify(lease.values)).byteLength > 64 * 1024) {
+      ctx.addIssue({ code: 'custom', path: ['values'], message: 'memory connection secret lease exceeds 64 KiB' })
+    }
+  })
+
+const StdioMemoryConnectionSpec = MemoryConnectionSpecBase.extend({
+  transport: z.literal('stdio'),
+  // This is a logical lookup key in the daemon operator's local allowlist, not
+  // a path/command supplied by the tenant or Control Plane.
+  commandRef: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'commandRef must be an allowlist key'),
+  secretLease: MemoryConnectionSecretLease
+})
+  .strict()
+  .superRefine((spec, ctx) => {
+    const keys = Object.keys(spec.secretLease.values).sort()
+    const declared = [...spec.secretKeys].sort()
+    if (keys.length !== declared.length || keys.some((key, index) => key !== declared[index])) {
+      ctx.addIssue({ code: 'custom', path: ['secretLease'], message: 'secret lease keys must match secretKeys' })
+    }
+  })
+
+const TransportedMemoryConnectionSpec = z.discriminatedUnion('transport', [
+  RemoteMemoryConnectionSpec,
+  StdioMemoryConnectionSpec
+])
+
+/** One daemon-private connection definition. Both relay grants and local secret
+ * leases are secret-bearing; callers must never log this frame or validation
+ * payload. Local commands are resolved solely from the operator allowlist. */
+export const MemoryConnectionSpec = TransportedMemoryConnectionSpec
+export type MemoryConnectionSpec = z.infer<typeof MemoryConnectionSpec>
+
+/** C→D live CRUD; reconnect baseline is `register/ok.memoryConnections`. */
+export const MemoryConnectionUpsert = MemoryConnectionSpec
+export type MemoryConnectionUpsert = z.infer<typeof MemoryConnectionUpsert>
+
+export const MemoryConnectionRemove = z.object({ connectionId: z.string().uuid() }).strict()
+export type MemoryConnectionRemove = z.infer<typeof MemoryConnectionRemove>
+
+/** Stable, body-free probe fact for one connection revision. */
+export const MemoryConnectionFact = z
+  .object({
+    connectionId: z.string().uuid(),
+    revision: z.number().int().positive(),
+    pluginId: z.string().min(1).max(255),
+    version: z.string().max(128).optional(),
+    profile: z.literal(MEMORY_PLUGIN_PROFILE).optional(),
+    manifestDigest: z
+      .string()
+      .regex(/^sha256:[a-f0-9]{64}$/)
+      .optional(),
+    capabilities: MemoryPluginManifest.shape.capabilities.optional(),
+    // The manifest's bounded settings schema (memory-plugin.ts): the console renders it as fields.
+    configSchema: MemoryPluginManifest.shape.connection.shape.configSchema.optional(),
+    declaredEgressHosts: z.array(z.string().min(1).max(255)).max(128).optional(),
+    status: z.enum(['probing', 'ready', 'degraded', 'invalid']),
+    reasonCode: z.string().min(1).max(128).optional()
+  })
+  .strict()
+export type MemoryConnectionFact = z.infer<typeof MemoryConnectionFact>
+
+/** D→C full snapshot. Re-emitted on reconnect and after every probe transition. */
+export const MemoryConnectionFacts = z.object({ connections: z.array(MemoryConnectionFact).max(1_024) }).strict()
+export type MemoryConnectionFacts = z.infer<typeof MemoryConnectionFacts>

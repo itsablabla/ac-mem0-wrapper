@@ -1,0 +1,70 @@
+{
+  "name": "@agentconnect.md/relay",
+  "version": "2.0.0-dev",
+  "description": "AgentConnect relay — the unified ingress plane (HTTP bot / webhook / webchat) that dials the control-plane and forwards to daemons",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "dist/index.js",
+  "bin": {
+    "agentconnect-relay": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "pnpm --filter \"{.}...\" build:package",
+    "build:package": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",
+    "prepack": "pnpm run build",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.typecheck.json"
+  },
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@agentconnect.md/activation-policy": "workspace:*",
+    "@agentconnect.md/connection": "workspace:*",
+    "@agentconnect.md/message": "workspace:*",
+    "@agentconnect.md/observability": "workspace:*",
+    "@agentconnect.md/protocol": "workspace:*",
+    "@slack/web-api": "^8.2.0",
+    "fastify": "^5.12.5",
+    "jose": "^6.2.12",
+    "undici": "^8.11.2",
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@ag-ui/client": "^1.0.2",
+    "@ag-ui/core": "^1.0.2",
+    "@types/node": "^24.19.1",
+    "@types/ws": "^8.18.2",
+    "ai": "^7.0.128",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.3"
+  },
+  "keywords": [
+    "agentconnect",
+    "ingress",
+    "relay",
+    "websocket"
+  ],
+  "engines": {
+    "node": ">=24.12.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

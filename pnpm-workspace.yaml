@@ -1,0 +1,33 @@
+packages:
+  - 'packages/*'
+
+# pnpm 11 only runs install/build scripts for dependencies approved here.
+allowBuilds:
+  '@prisma/client': true
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true
+  sharp: true
+  unrs-resolver: true
+  better-sqlite3: false
+  cpu-features: false
+  onnxruntime-node: false
+  protobufjs: false
+  ssh2: false
+  '@playwright/browser-chromium': false
+  '@swc/core': false
+  core-js: false
+  # next-intl's message-extraction watcher; only its CLI needs the native binary.
+  '@parcel/watcher': false
+
+minimumReleaseAge: 60
+
+# Custom ACP evaluations do not use these optional providers with unpatched dependencies.
+ignoredOptionalDependencies:
+  - '@huggingface/transformers'
+  - '@openai/codex-security'
+
+# Prisma 7 still pins these affected dependencies; remove when upstream updates them.
+overrides:
+  '@prisma/config@7>deepmerge-ts': 8.0.2
+  'prisma@7>mysql2': 3.24.4

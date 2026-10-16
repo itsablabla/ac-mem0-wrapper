@@ -1,0 +1,60 @@
+{
+  "private": true,
+  "name": "agentconnect",
+  "version": "2.0.0-dev",
+  "description": "Multi-agent platform bridging IM platforms to AI coding agents",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "pnpm -r build:package",
+    "clean": "pnpm -r clean",
+    "dev": "pnpm -r --parallel dev",
+    "eval:addons": "pnpm --filter @agentconnect.md/daemon build && node evals/run-addons.mjs",
+    "eval:addons:view": "promptfoo view -n",
+    "eval:collab": "pnpm --filter @agentconnect.md/daemon build && node evals/run-collaboration.mjs",
+    "eval:collab:contracts": "vitest run evals/test/routing-acceptance.test.ts evals/test/connection-surface.test.ts evals/test/virtual-connections.test.ts evals/test/world-authorization.test.ts evals/test/topology.test.ts evals/test/counting.test.ts evals/test/quota-counting.test.ts evals/test/cross-room-counting.test.ts evals/test/werewolf.test.ts evals/test/webchat-night-collection.test.ts evals/test/webchat-werewolf.test.ts evals/test/game-runner.test.ts evals/test/game-subject.test.ts evals/test/collaboration-game-provider.test.ts evals/test/game-result-assertion.test.ts packages/daemon/test/evaluation-game-ingress.test.ts packages/daemon/test/evaluation-game-tools.test.ts",
+    "eval:collab:routing": "vitest run evals/test/routing-acceptance.test.ts evals/test/connection-surface.test.ts",
+    "eval:collab:view": "promptfoo view -n",
+    "eval:contracts": "vitest run packages/daemon/test/evaluation-events.test.ts packages/daemon/test/evaluation-atif.test.ts packages/daemon/test/evaluation-permission.test.ts packages/daemon/test/evaluation-runner.test.ts packages/daemon/test/daemon-evaluation.test.ts evals/test/outcome.test.ts evals/test/provider.test.ts evals/test/paired-summary.test.ts",
+    "eval:gates": "vitest run packages/daemon/test/evaluation-events.test.ts packages/daemon/test/evaluation-atif.test.ts packages/daemon/test/evaluation-permission.test.ts packages/daemon/test/evaluation-runner.test.ts packages/daemon/test/daemon-evaluation.test.ts evals/test/outcome.test.ts evals/test/provider.test.ts evals/test/paired-summary.test.ts evals/test/routing-acceptance.test.ts evals/test/connection-surface.test.ts evals/test/virtual-connections.test.ts evals/test/world-authorization.test.ts evals/test/topology.test.ts evals/test/counting.test.ts evals/test/quota-counting.test.ts evals/test/cross-room-counting.test.ts evals/test/werewolf.test.ts evals/test/webchat-night-collection.test.ts evals/test/webchat-werewolf.test.ts evals/test/game-runner.test.ts evals/test/game-subject.test.ts evals/test/collaboration-game-provider.test.ts evals/test/game-result-assertion.test.ts packages/daemon/test/evaluation-game-ingress.test.ts packages/daemon/test/evaluation-game-tools.test.ts evals/test/parity-spec.test.ts evals/test/parity-slack.test.ts evals/test/parity-webchat.test.ts",
+    "eval:parity": "vitest run evals/test/parity-spec.test.ts evals/test/parity-slack.test.ts evals/test/parity-webchat.test.ts",
+    "eval:validate": "node evals/run-validate.mjs && tsc -p evals/tsconfig.json",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "prepare": "sh ./scripts/setup-hooks.sh",
+    "test": "pnpm -r test",
+    "test:unit": "pnpm -r test:unit && node --test scripts/*.test.mjs",
+    "typecheck": "pnpm -r typecheck",
+    "typecheck:ci": "pnpm --filter '!@agentconnect.md/web' --config.enable-pre-post-scripts=false -r typecheck"
+  },
+  "dependencies": {
+    "@semantic-release/github": "^12.0.10",
+    "conventional-changelog-conventionalcommits": "^9.3.1",
+    "semantic-release": "^25.0.8"
+  },
+  "devDependencies": {
+    "@formatjs/icu-messageformat-parser": "^3.5.21",
+    "@types/node": "^24.19.1",
+    "@typescript-eslint/parser": "^8.71.1",
+    "eslint": "^10.12.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-import-resolver-typescript": "^4.4.5",
+    "eslint-plugin-import-x": "^4.17.1",
+    "eslint-plugin-unused-imports": "^4.4.1",
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.9",
+    "prettier-package-json": "^2.8.0",
+    "prettier-plugin-sh": "^0.20.2",
+    "promptfoo": "0.124.0",
+    "semver": "^7.8.5",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.1",
+    "vitest": "^5.0.3",
+    "yaml": "^2.9.1"
+  },
+  "engines": {
+    "node": ">=24.12.0"
+  },
+  "packageManager": "pnpm@11.19.0"
+}

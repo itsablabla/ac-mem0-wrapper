@@ -1,0 +1,172 @@
+import { z } from 'zod'
+import { Platform, RouteAssign } from './route.js'
+import { CronUpsert } from './cron.js'
+import { SecretsGrant } from './secrets.js'
+import { AgentSpec } from './agent.js'
+import { IntegrationSpec } from './integration.js'
+import { McpServerSpec } from './mcpserver.js'
+import { MemoryConnectionSpec } from './memory-connection.js'
+import { CollabRoutesSnapshot } from './collab.js'
+import { GitCommitIdentity } from './gitcred.js'
+import { ExecutorFacts, ExecutorStrategyTable } from './executor.js'
+
+/**
+ * Capability upload + the reconcile snapshot — protocol §3.3.
+ *
+ * `register/ok` is the authoritative source of truth: the daemon converges its
+ * local cache to it. CP wins all conflicts, so re-issuing the same snapshot is
+ * idempotent.
+ */
+
+export const RegisterReq = z.object({
+  host: z.string(), // hostname (display only)
+  // Rollout generation of a pool member (the deployment's pod-template hash, from AC_POD_TEMPLATE_HASH).
+  // Only the newest live generation of a member set may claim vacated duty groups; absent for
+  // local daemons and older pods, which the rule never excludes.
+  generation: z.string().min(1).max(128).optional(),
+  // Fresh on every daemon process start: a restart completes only when a different boot registers (high-availability.md).
+  bootId: z.string().uuid().optional(),
+  // An OBSERVER connection: the `reconcile --once` CronJob, which authenticates with the same
+  // projected pool identity but serves nothing. The CP admits the identity and answers reads, but
+  // enrolls it in no member set, so the duty ledger can never grant it anything (k8s-daemon-pool.md §4).
+  observer: z.boolean().optional(),
+  capabilities: z.object({
+    platforms: z.array(Platform), // D3 adapters present
+    runtimes: z.array(z.string()), // e.g. ["claude","codex"]
+    acp: z.boolean(), // can this daemon host ACP sessions (D6)?
+    features: z.array(z.string()).default([]), // e.g. ["cli-wrapper-fallback","worktree-iso"]
+    // Session-executor facts (session-executors.md §6); absent for a daemon that reports none, and stripped by a CP that predates them.
+    executor: ExecutorFacts.optional(),
+    // The machine's own effective strategy table (§5), in the executor report's shape: what its own sessions can run in, and what an agent's `execution` is checked against; each unavailable entry carries its probe's reason.
+    strategies: ExecutorStrategyTable.optional(),
+    // The shared PostgreSQL store's id (one per database); absent on a private local store. Members of a group that report the same id read each other's sessions.
+    contentStore: z.string().uuid().optional()
+  }),
+  maxAgents: z.number().int(), // concurrency ceiling for placement (C3)
+  localState: z.object({
+    // what the daemon currently believes it owns (for reconcile)
+    assignments: z.array(z.string()), // sessionKeys it is actively serving
+    crons: z.array(z.string()), // cronIds it has scheduled
+    leases: z.array(z.string()), // leaseIds it holds
+    // Active on-disk replicas plus fail-closed interrupted-removal markers.
+    // `unknown` is the rolling-upgrade/legacy value:
+    // the CP may prune it only when the durable row proves the replica moved.
+    // Defaults keep an older daemon compatible with a newer CP.
+    agents: z.array(z.object({ agentId: z.string(), origin: z.enum(['cp', 'unknown']) })).default([]),
+    integrations: z.array(z.object({ integrationId: z.string(), origin: z.enum(['cp', 'unknown']) })).default([]),
+    // Durable fail-closed move tombstones. A newer CP repairs entries with a
+    // valid token after register/ok. A missing token represents corrupt local
+    // metadata: the daemon keeps that agent drained for manual repair without
+    // making the whole registration undecodable.
+    stagedAgents: z.array(z.object({ agentId: z.string(), moveId: z.string().uuid().optional() })).default([])
+  })
+})
+export type RegisterReq = z.infer<typeof RegisterReq>
+
+/**
+ * D→C EVT (`capabilities/update`) — hot full-replace of the connection's
+ * `RegisterReq.capabilities`. `register` computes the feature set before the
+ * reconcile roster lands and before the runtime probe sweep runs, so a feature
+ * derived from either would otherwise stay hidden until the next reconnect.
+ * `webchat_remote_mcp_v1` is not one of those dynamic features: it reflects the
+ * daemon's confidential grant-delivery implementation, independently of roster,
+ * runtime probe, and sandbox state. The daemon re-announces whenever its computed
+ * capability set changes mid-connection; the CP treats it exactly like the register
+ * value it refreshes. An older CP replies `error{UNKNOWN_FRAME}`, which the daemon
+ * ignores — the feature then simply waits for the next register, the pre-frame behavior.
+ */
+export const CapabilitiesUpdate = z.object({
+  capabilities: RegisterReq.shape.capabilities
+})
+export type CapabilitiesUpdate = z.infer<typeof CapabilitiesUpdate>
+
+/**
+ * One relay the daemon SHOULD hold an outbound WS to (shared-bot-relay.md §5).
+ * The roster is all-to-all by design: a webchat/webhook landing on ANY relay
+ * instance must find this daemon's connection without cross-instance forwarding.
+ * That only holds if `url` (the relay's registered `daemonUrl`) routes to that
+ * SPECIFIC instance — the daemon confirms the landing spot against
+ * `rd/hello/ok.relayId` and treats a mismatch as a deployment misroute.
+ */
+export const RelayRosterEntry = z.object({
+  relayId: z.string().uuid(),
+  url: z.string() // the relay's daemonUrl — per-instance routable, never a pool LB
+})
+export type RelayRosterEntry = z.infer<typeof RelayRosterEntry>
+
+/**
+ * C→D EVT (`relay/roster`) — hot roster update (relay registered / swept).
+ * Carries the WHOLE desired set, same converge-don't-diff semantics as the
+ * `register/ok.relays` snapshot it refreshes.
+ */
+export const RelayRosterUpdate = z.object({
+  relays: z.array(RelayRosterEntry)
+})
+export type RelayRosterUpdate = z.infer<typeof RelayRosterUpdate>
+
+/**
+ * Console-set retention window for FINISHED sessions on the daemon's LOCAL
+ * store (the daemon settings' "Expire sessions" option). CP-durable; the
+ * register/ok snapshot is the reconnect baseline and a `config/push` with
+ * `sessions.retention` is the hot update.
+ *
+ * `'never'` disables the sweep; otherwise an integer number of days as
+ * `'<n>d'` (e.g. `'7d'`) — n ≥ 1, capped at 4 digits so a typo can't encode
+ * a multi-millennium window.
+ */
+export const SESSION_RETENTION_RE = /^(?:never|[1-9]\d{0,3}d)$/
+export type SessionRetentionSetting = 'never' | `${number}d`
+export const SessionRetentionSetting = z.custom<SessionRetentionSetting>(
+  (v) => typeof v === 'string' && SESSION_RETENTION_RE.test(v),
+  { message: "expected 'never' or '<days>d' (e.g. '7d')" }
+)
+
+export const RegisterOk = z.object({
+  routingEpoch: z.number().int(), // version of the routing table this snapshot reflects
+  // CP protocol capabilities. Default keeps a new daemon compatible with an
+  // older CP during rolling deploys; old daemons ignore this additive field.
+  serverFeatures: z.array(z.string()).default([]),
+  // Public attribution for github-app workspace commits. Derived from this
+  // deployment's App slug; optional so new daemons still accept an older CP.
+  gitCommitIdentity: GitCommitIdentity.optional(),
+  // Console-set finished-session retention for this daemon's local store —
+  // optional so new daemons still accept an older CP (absent ⇒ keep local config).
+  sessionRetention: SessionRetentionSetting.optional(),
+  // The deployment's transfer cache, so a shared image can choose its original's home before any signing; absent ⇒ none.
+  fileTransfer: z.object({ maxBytes: z.number().int().positive() }).optional(),
+  // Authoritative reconcile snapshot — daemon converges its local cache to this:
+  assignments: z.array(RouteAssign), // the route/assign set the daemon SHOULD own
+  agents: z.array(AgentSpec.extend({ agentId: z.string().uuid() })).default([]), // spec set CP wants present; daemon converges
+  crons: z.array(CronUpsert), // the cron set it SHOULD run
+  // Platform integrations this daemon SHOULD hold — FILTERED to this daemon (never
+  // org-wide), since each element carries plaintext tokens. Never log this array.
+  integrations: z.array(IntegrationSpec).default([]),
+  // MCP server defs this daemon SHOULD hold — FILTERED to this daemon (only providers
+  // its agents enable). In the MCP-proxy model these carry a relay proxy URL + a bearer
+  // grant key (not the upstream secret), but treat as sensitive — never log this array.
+  // Defaulted so a pre-MCP-registry CP's snapshot still parses.
+  mcpServers: z.array(McpServerSpec).default([]),
+  // External-memory defs this daemon's agents reference. Relay grants and local
+  // secret leases are daemon-private and must never be logged.
+  memoryConnections: z.array(MemoryConnectionSpec).default([]),
+  leases: z.array(SecretsGrant), // secret leases it SHOULD hold
+  // Relay roster — the relays this daemon SHOULD dial (webchat ingress now;
+  // shared-bot/webhook with milestone B). Hot updates ride `relay/roster`;
+  // defaulted so a pre-relay CP's snapshot still parses.
+  relays: z.array(RelayRosterEntry).default([]),
+  // Bot-agnostic collaboration routing snapshot (agent-collaboration §2.3 / §6.5) —
+  // the reconnect BASELINE for this daemon's terminal-verify of REMOTE agent callers.
+  // Scoped to channels this daemon's agents participate in. Hot changes ride the
+  // `collaboration/routes` EVT. Defaulted so a pre-collab CP's snapshot still parses.
+  collabRoutes: CollabRoutesSnapshot.default({ generation: 0, channels: [], agents: [], platformKinds: [] }),
+  drop: z.object({
+    // things in localState the CP says to release
+    assignments: z.array(z.string()),
+    crons: z.array(z.string()),
+    // A missed live move archives the replica (preserving workspace/memory); a
+    // missed delete removes a replica that carries the explicit CP marker.
+    agents: z.array(z.object({ agentId: z.string(), action: z.enum(['detach', 'remove']) })).default([]),
+    integrations: z.array(z.string()).default([])
+  })
+})
+export type RegisterOk = z.infer<typeof RegisterOk>

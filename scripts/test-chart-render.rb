@@ -1,0 +1,837 @@
+#!/usr/bin/env ruby
+# Render contract for charts/agentconnect: the load-bearing facts of the daemon pool, the
+# runtime SandboxTemplate/warm pool, the cluster-scoped RBAC, and the agents namespace —
+# rendered with plain `helm template` and synthetic values, no cluster required.
+
+require 'yaml'
+require 'open3'
+require 'json'
+
+chart = File.expand_path('../charts/agentconnect', __dir__)
+command = [
+  'helm', 'template', 'example-agentconnect', chart,
+  '--namespace', 'agentconnect-example',
+  '--set', 'image.tag=v1.41.0-rc.90',
+  '--set', 'daemonPool.runtime.tag=v1.41.0-rc.88',
+  '--set', 'daemonPool.enabled=true',
+  '--set', 'daemonPool.tag=v1.41.0-rc.89',
+  '--set', 'daemonPool.sandboxNamespace=agentconnect-example-agents',
+  '--set', 'daemonPool.dataPlane.existingSecret=example-data-plane',
+  # Install-wide model credentials arrive by reference, so the render must never carry a value.
+  '--set', 'daemonPool.modelCredentials.existingSecret=example-model-credentials',
+  '--set-json', 'daemonPool.runtimeEnvironment.runtimes={"qwen-code":{"OPENAI_API_KEY":"PROVIDER_KEY"}}',
+  # The operator's clone policy: a self-managed code host is served only if the deployment says so.
+  '--set-json', 'daemonPool.workspaceGitAllowedOrigins=["https://github.com","https://gitlab.example.test"]',
+  # Placement is per-install, so the contract only holds if a consumer's values can set it.
+  '--set-json', 'daemonPool.runtime.nodeSelector={"example.com/agents":"true"}',
+  '--set-json', 'daemonPool.runtime.tolerations=' \
+    '[{"key":"example.com/agents","operator":"Equal","value":"true","effect":"NoSchedule"}]',
+  # Both pull-secret wires, set to different names so the render proves they stay separate.
+  '--set-json', 'imagePullSecrets=[{"name":"example-pull"}]',
+  '--set-json', 'daemonPool.runtime.imagePullSecrets=[{"name":"example-sandbox-pull"}]',
+  # Off here so the object-count assertions below see only chart-owned objects, not the
+  # vendored stack; the defaults render at the end covers the default-on stack.
+  '--set', 'installCRD=false'
+]
+
+rendered, error, status = Open3.capture3(*command)
+abort("helm template failed:\n#{error}") unless status.success?
+
+documents = YAML.load_stream(rendered).compact
+find = lambda do |kind, name|
+  documents.find { |doc| doc['kind'] == kind && doc.dig('metadata', 'name') == name } ||
+    abort("missing #{kind}/#{name}")
+end
+
+deployment = find.call('Deployment', 'example-agentconnect-daemon-pool')
+spec = deployment.fetch('spec')
+pod_template = spec.fetch('template')
+pod = pod_template.fetch('spec')
+container = pod.fetch('containers').find { |item| item['name'] == 'daemon-pool' } || abort('missing daemon-pool container')
+env = container.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+mounts = container.fetch('volumeMounts').to_h { |item| [item.fetch('name'), item] }
+volumes = pod.fetch('volumes').to_h { |item| [item.fetch('name'), item] }
+
+# Runtime-specific keys stay in a Secret even though the binding itself is deployment config.
+binding = JSON.parse(env.fetch('AC_RUNTIME_ENV_BINDINGS')).fetch('qwen-code').fetch('OPENAI_API_KEY')
+entry = container.fetch('env').find { |item| item['name'] == binding } || abort('missing runtime Secret source')
+abort('runtime binding must reference the configured Secret') unless
+  entry.dig('valueFrom', 'secretKeyRef') == { 'name' => 'example-model-credentials', 'key' => 'PROVIDER_KEY' }
+abort('runtime binding must never contain the key value') if entry.key?('value')
+
+abort('daemon pool must default to three replicas') unless spec['replicas'] == 3
+# Readiness is a real signal (#1056), so this is only a settle margin on top of it — not a
+# timed stand-in for "registered and probed".
+abort('daemon-pool rollout must keep a short settle margin over the readiness probe') unless spec['minReadySeconds'] == 10
+# Surge the whole pool, then drain the old members: capacity never dips and each agent moves once.
+abort('daemon-pool rollout must be a rolling update') unless spec.dig('strategy', 'type') == 'RollingUpdate'
+abort('daemon-pool rollout must surge the whole pool at zero unavailability') unless spec.dig('strategy', 'rollingUpdate') == {
+  'maxSurge' => '100%', 'maxUnavailable' => 0
+}
+# The daemon's own `limits.poolShutdownDrainMs` (300s) plus margin. A shorter grace period
+# SIGKILLs the drain, and the groups it was releasing wait out their leases instead.
+abort('daemon-pool grace period must outlast the shutdown drain budget') unless pod['terminationGracePeriodSeconds'] == 330
+# `ac-cloud-daemon`, not `ac-daemon-pool`: the SA name is the app's identity contract and was
+# deliberately left behind when everything else took the daemon-pool vocabulary.
+abort('daemon pool must use the fixed Kubernetes identity') unless pod['serviceAccountName'] == 'ac-cloud-daemon'
+abort('daemon pool must use its effective component tag') unless container['image'] == 'ghcr.io/agentconnect-md/daemon:v1.41.0-rc.89'
+# Unset leaves the image's own CMD, so an install that says nothing about the ceiling gets the
+# daemon's default rather than a chart-owned one.
+abort('an unset maxAgents must not override the image CMD') if container.key?('args')
+# 0 is the daemon's UNBOUNDED sentinel, so the guard has to test for null, not for truth — a
+# truthiness check would silently drop exactly the value that removes the ceiling.
+%w[256 0].each do |ceiling|
+  rendered_ceiling, error_ceiling, status_ceiling = Open3.capture3(*command, '--set', "daemonPool.maxAgents=#{ceiling}")
+  abort("rendering maxAgents=#{ceiling} failed:\n#{error_ceiling}") unless status_ceiling.success?
+  pooled = YAML.load_stream(rendered_ceiling).compact.find { |doc|
+    doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool'
+  }
+  args = pooled.dig('spec', 'template', 'spec', 'containers').find { |item| item['name'] == 'daemon-pool' }&.fetch('args', nil)
+  abort("maxAgents=#{ceiling} must reach the daemon as argv") unless args == ['run', '--k8s', '--max-agents', ceiling]
+end
+# Keyed from the EFFECTIVE full reference so a `runtime.image` pin or digest change rolls the
+# members and repeats runtime discovery exactly like a tag change does.
+abort('runtime image changes must roll daemon-pool probes') unless pod_template.dig('metadata', 'annotations', 'agentconnect.md/runtime-sandbox-image') == 'ghcr.io/agentconnect-md/runtime-sandbox:v1.41.0-rc.88'
+abort('daemon pool must use in-cluster CP websocket') unless env['AC_CP_URL'] == 'ws://example-agentconnect-control-plane:8080/daemon/ws'
+abort('daemon pool must declare Kubernetes supervision') unless env['AGENTCONNECT_SUPERVISOR'] == 'k8s'
+abort('daemon pool must claim against the release-prefixed warm pool') unless env['AC_K8S_WARM_POOL'] == 'example-agentconnect-runtime-pool'
+abort('daemon pool must use the configured sandbox namespace') unless env['AC_K8S_SANDBOX_NAMESPACE'] == 'agentconnect-example-agents'
+abort('install-wide daemon pool must not be pinned to one org') if env.key?('AC_K8S_ORG_ID')
+# The member publishes readiness only when told which port to serve it on, and the probe must
+# read that same port — a mismatch is a pool that never becomes Ready and a wedged rollout.
+abort('daemon pool must serve its readiness endpoint') unless env['AC_READINESS_PORT'] == '8081'
+
+# Install-wide model credentials: BY REFERENCE, every entry optional, and the key is the variable
+# name the daemon reads. A rendered `value:` here would put a provider key in the pod spec, and a
+# non-optional entry would wedge every member of an install whose Secret names one provider.
+model_credential_env = container.fetch('env').select { |item| item.fetch('name').end_with?('MODEL_TOKEN', 'MODEL_BASE_URL') }
+%w[MODEL_TOKEN MODEL_BASE_URL ANTHROPIC_MODEL_TOKEN ANTHROPIC_MODEL_BASE_URL
+   OPENAI_MODEL_TOKEN OPENAI_MODEL_BASE_URL DEEPSEEK_MODEL_TOKEN DEEPSEEK_MODEL_BASE_URL].each do |name|
+  entry = model_credential_env.find { |item| item.fetch('name') == name } ||
+          abort("daemon pool must project #{name} from the model-credential Secret")
+  abort("#{name} must be a Secret reference, never a value") if entry.key?('value')
+  abort("#{name} must read its own name from the named Secret") unless
+    entry.dig('valueFrom', 'secretKeyRef') == { 'name' => 'example-model-credentials', 'key' => name, 'optional' => true }
+end
+
+# The clone-origin allowlist reaches the member as ONE comma-separated value: the daemon replaces
+# its default list with what it is given, so a list split across entries would serve a shorter
+# policy than the operator wrote, and an install serving a self-managed host would refuse it.
+git_origins = env['AC_WORKSPACE_GIT_ALLOWED_ORIGINS'] ||
+              abort('daemon pool must carry the operator clone-origin policy when values state one')
+abort("clone origins must be one comma-separated value, got #{git_origins.inspect}") unless
+  git_origins == 'https://github.com,https://gitlab.example.test'
+
+# One source per install. An entry the Secret omits is a supported shape, so a second source
+# filling that same variable assembles a pair out of two halves — a provider key aimed at a
+# gateway base URL, or a gateway key at a provider's. The chart cannot see inside the Secret, so
+# it must refuse the overlap rather than render it.
+[['daemonPool.extraEnv.DEEPSEEK_MODEL_TOKEN=example-key', 'collides'],
+ ['modelEgress.enabled=true', 'both write this pool']].each do |setting, expected|
+  extra = setting.start_with?('modelEgress') ? [
+    '--set', setting, '--set-json', 'modelEgress.ports=[8080]',
+    '--set', 'modelEgress.clients.claude.baseUrl=http://gateway.example.test:8080',
+    '--set', 'modelEgress.clients.claude.apiKey=example'
+  ] : ['--set', setting]
+  _, refused, refused_status = Open3.capture3(*command, *extra)
+  abort("#{setting} must be refused beside a model-credential Secret") if refused_status.success?
+  abort("refusal for #{setting} must say why:\n#{refused}") unless refused.include?(expected)
+end
+# The CP keeps connection and control state per process, so a second replica must be refused.
+_, replicas_refused, replicas_status = Open3.capture3(*command, '--set', 'controlPlane.replicas=2')
+abort('controlPlane.replicas above 1 must be refused') if replicas_status.success?
+abort("refusal for controlPlane.replicas must say why:\n#{replicas_refused}") unless replicas_refused.include?('controlPlane.replicas above 1')
+readiness = container['readinessProbe'] || abort('daemon pool member must have a readiness probe')
+abort('readiness probe must GET /readyz on the readiness port') unless readiness['httpGet'] == { 'path' => '/readyz', 'port' => 8081 }
+abort('readiness probe timings must match #1056') unless readiness.reject { |key, _| key == 'httpGet' } == {
+  'initialDelaySeconds' => 5, 'periodSeconds' => 5, 'timeoutSeconds' => 2,
+  'successThreshold' => 1, 'failureThreshold' => 3
+}
+# The readiness port is a probe surface. A Service that routed it would send real traffic to a
+# port that serves nothing but /readyz, and would publish the member on a second path.
+abort('the readiness port must not be exposed through a Service') if documents.any? { |doc|
+  doc['kind'] == 'Service' && doc.dig('spec', 'ports').to_a.any? { |port| [port['port'], port['targetPort']].include?(8081) }
+}
+# The generation the control plane will fence old members by (#1016). A member that cannot
+# tell which pod template it came from cannot be excluded from claiming after a rollout.
+generation = container.fetch('env').find { |item| item['name'] == 'AC_POD_TEMPLATE_HASH' }
+abort('daemon pool must expose its pod-template generation') unless generation&.dig('valueFrom', 'fieldRef', 'fieldPath') == "metadata.labels['pod-template-hash']"
+abort('missing data-plane config mount') unless mounts.dig('data-plane', 'mountPath') == '/var/run/ac-data-plane' && mounts.dig('data-plane', 'readOnly')
+abort('missing Kubernetes identity mount') unless mounts.dig('cp-identity', 'mountPath') == '/var/run/ac-cp-identity' && mounts.dig('cp-identity', 'readOnly')
+abort('wrong data-plane Secret') unless volumes.dig('data-plane', 'secret', 'secretName') == 'example-data-plane'
+token = volumes.dig('cp-identity', 'projected', 'sources')&.first&.dig('serviceAccountToken')
+abort('wrong CP token projection') unless token == { 'path' => 'token', 'audience' => 'ac-control-plane', 'expirationSeconds' => 3600 }
+
+find.call('ServiceAccount', 'ac-cloud-daemon')
+runtime_role = find.call('Role', 'example-agentconnect-daemon-pool-runtime')
+abort('runtime Role must live with the sandboxes') unless runtime_role.dig('metadata', 'namespace') == 'agentconnect-example-agents'
+runtime_rules = runtime_role.fetch('rules')
+abort('daemon pool cannot manage SandboxClaims') unless runtime_rules.any? { |r| r['resources'] == ['sandboxclaims'] && r['verbs'].sort == %w[create delete get list patch watch] }
+abort('daemon pool cannot read warm pools and sandbox templates') unless runtime_rules.any? do |r|
+  r['apiGroups'] == ['extensions.agents.x-k8s.io'] &&
+    r['resources'].sort == %w[sandboxtemplates sandboxwarmpools] &&
+    r['verbs'] == ['get']
+end
+abort('daemon pool cannot manage Sandboxes') unless runtime_rules.any? { |r| r['resources'] == ['sandboxes'] && r['verbs'].sort == %w[delete get list patch watch] }
+runtime_binding = find.call('RoleBinding', 'example-agentconnect-daemon-pool-runtime')
+abort('runtime RoleBinding must live with the sandboxes') unless runtime_binding.dig('metadata', 'namespace') == 'agentconnect-example-agents'
+abort('runtime RoleBinding must bind the daemon ServiceAccount across namespaces') unless runtime_binding.fetch('subjects') == [{
+  'kind' => 'ServiceAccount', 'name' => 'ac-cloud-daemon', 'namespace' => 'agentconnect-example'
+}]
+network_policy = find.call('NetworkPolicy', 'example-agentconnect-daemon-pool-shim')
+abort('shim ingress policy must live with the sandboxes') unless network_policy.dig('metadata', 'namespace') == 'agentconnect-example-agents'
+abort('shim ingress policy must select every AgentConnect sandbox') unless network_policy.dig('spec', 'podSelector') == {
+  'matchLabels' => { 'agentconnect.md/sandbox' => 'true' }
+}
+abort('shim policy must isolate ingress only') unless network_policy.dig('spec', 'policyTypes') == ['Ingress']
+abort('shim policy must not add sandbox egress rules') if network_policy.fetch('spec').key?('egress')
+ingress_rules = network_policy.dig('spec', 'ingress')
+abort('shim policy must have one coarse ingress rule') unless ingress_rules&.length == 1
+ingress = ingress_rules.first
+source_peers = ingress['from']
+abort('shim ingress must have one daemon-pool source peer') unless source_peers&.length == 1
+abort('shim ingress does not bind namespace and daemon-pool identity') unless source_peers.first == {
+  'namespaceSelector' => {
+    'matchLabels' => { 'kubernetes.io/metadata.name' => 'agentconnect-example' }
+  },
+  'podSelector' => {
+    'matchLabels' => {
+      'app.kubernetes.io/name' => 'agentconnect',
+      'app.kubernetes.io/instance' => 'example-agentconnect',
+      'app.kubernetes.io/component' => 'daemon-pool'
+    }
+  }
+}
+abort('shim ingress policy does not allow TCP/8085') unless ingress['ports'] == [{ 'protocol' => 'TCP', 'port' => 8085 }]
+# The peer selector and the daemon pool's own labels must agree, or the policy names a set
+# of pods that does not exist and shim ingress silently closes. Both sides come from one
+# helper — assert the rendered result so a future edit to either cannot separate them.
+peer_selector = source_peers.first.dig('podSelector', 'matchLabels')
+abort('shim peer selector does not match the daemon-pool Deployment selector') unless peer_selector == spec.dig('selector', 'matchLabels')
+pool_pod_labels = pod_template.dig('metadata', 'labels')
+abort('shim peer selector does not select the daemon-pool pods') unless peer_selector.all? { |key, value| pool_pod_labels[key] == value }
+
+# The runtime prerequisites the daemon pool claims through. Both are chart-owned and named like
+# every other chart-owned object, derived from the release rather than configured.
+sandbox_template = find.call('SandboxTemplate', 'example-agentconnect-runtime')
+abort('runtime template must live with the sandboxes') unless sandbox_template.dig('metadata', 'namespace') == 'agentconnect-example-agents'
+template_spec = sandbox_template.fetch('spec')
+abort('sandbox NetworkPolicy must stay controller-managed') unless template_spec['networkPolicyManagement'] == 'Managed'
+abort('a claim must not inject its own env') unless template_spec['envVarsInjectionPolicy'] == 'Disallowed'
+abort('a claim must not attach its own volumes') unless template_spec['volumeClaimTemplatesPolicy'] == 'Disallowed'
+egress_rules = template_spec.dig('networkPolicy', 'egress') || abort('runtime template must define sandbox egress')
+egress_ports = egress_rules.flat_map { |rule| rule.fetch('ports') }
+abort('sandbox egress must be exactly DNS and TLS') unless egress_ports.map { |p| p['port'] }.sort == [53, 53, 443]
+# A member dials the sandbox and replies ride that connection; a sandbox->daemon-pool rule would
+# only widen what an agent can reach.
+abort('sandbox egress must not name a peer') if egress_rules.any? { |rule| rule.key?('to') }
+# The controller renders the sandbox policy from the field above; a second chart-owned
+# NetworkPolicy for the same pods would be a duplicate nobody reconciles.
+sandbox_policies = documents.select { |doc| doc['kind'] == 'NetworkPolicy' }
+abort('chart must own exactly two NetworkPolicies (the agents baseline and the shim ingress)') unless sandbox_policies.length == 2
+
+# The template stamps the label the shim policy selects, so a sandbox is inside that policy from
+# birth rather than from its claim. Assert both ends here: split them and warm spares fall outside
+# the policy, where the default-deny baseline drops the pool's first dials in silence.
+abort('sandboxes must carry the label the shim ingress policy selects') unless
+  template_spec.dig('podTemplate', 'metadata', 'labels') == { 'agentconnect.md/sandbox' => 'true' }
+abort('shim policy and sandbox template must name one label') unless
+  network_policy.dig('spec', 'podSelector', 'matchLabels') == template_spec.dig('podTemplate', 'metadata', 'labels')
+
+template_pod = template_spec.dig('podTemplate', 'spec')
+abort('sandboxes must not mount an API credential') unless template_pod['automountServiceAccountToken'] == false
+# Pod- and container-level together are the `restricted` Pod Security profile the agents
+# namespace enforces; drop any of these and every sandbox is rejected at admission.
+abort('sandboxes must run non-root under the default seccomp profile') unless template_pod.fetch('securityContext') == {
+  'runAsNonRoot' => true, 'runAsUser' => 10001, 'runAsGroup' => 10001, 'fsGroup' => 10001,
+  'seccompProfile' => { 'type' => 'RuntimeDefault' }
+}
+abort('agent pods must be pinned to the configured node group') unless template_pod['nodeSelector'] == { 'example.com/agents' => 'true' }
+abort('agent pods must tolerate the configured node taint') unless template_pod['tolerations'] == [
+  { 'key' => 'example.com/agents', 'operator' => 'Equal', 'value' => 'true', 'effect' => 'NoSchedule' }
+]
+runtime_container = template_pod.fetch('containers').find { |item| item['name'] == 'runtime' } || abort('missing runtime container')
+abort('runtime container must use the effective runtime-sandbox tag') unless runtime_container['image'] == 'ghcr.io/agentconnect-md/runtime-sandbox:v1.41.0-rc.88'
+full_rendered, full_error, full_status = Open3.capture3(
+  *(command + ['--set', 'daemonPool.runtime.repository=ghcr.io/agentconnect-md/runtime-sandbox-full'])
+)
+abort("helm template (full runtime) failed:\n#{full_error}") unless full_status.success?
+full_documents = YAML.load_stream(full_rendered).compact
+full_image = 'ghcr.io/agentconnect-md/runtime-sandbox-full:v1.41.0-rc.88'
+full_pool = full_documents.find { |doc| doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool' }
+full_template = full_documents.find { |doc| doc['kind'] == 'SandboxTemplate' && doc.dig('metadata', 'name') == 'example-agentconnect-runtime' }
+abort('full runtime repository must roll pool probes') unless full_pool.dig('spec', 'template', 'metadata', 'annotations', 'agentconnect.md/runtime-sandbox-image') == full_image
+abort('full runtime repository must keep the effective runtime tag') unless full_template.dig('spec', 'podTemplate', 'spec', 'containers', 0, 'image') == full_image
+abort('runtime container must root the workspace and place the shim listener') unless runtime_container.fetch('env') == [
+  { 'name' => 'AC_SHIM_WORKSPACE_ROOT', 'value' => '/agent' },
+  { 'name' => 'AC_SHIM_PORT', 'value' => '8085' }
+]
+# One value serves all three shim surfaces: the sandbox listener, the member's dialer, and the
+# ingress policy port. Split them and an override leaves the shim on its baked-in default while
+# every daemon-to-sandbox bind times out.
+shim_listen = runtime_container.fetch('env').find { |item| item['name'] == 'AC_SHIM_PORT' }&.fetch('value')
+abort('the shim listener, the dialer, and the policy must share one port') unless
+  shim_listen == env['AC_K8S_SHIM_PORT'] && Integer(shim_listen) == ingress['ports'].first['port']
+# Two pull-secret wires, one per namespace, and they must not cross. A chart-rendered pod lands
+# in the release namespace and takes the install-wide value; a sandbox pod is created by the
+# controller in the sandbox namespace, where the kubelet resolves the secret, so it takes
+# `daemonPool.runtime.imagePullSecrets`. Cross them and the reference names a Secret that is not
+# in the pod's namespace — FailedToRetrieveImagePullSecret on every sandbox.
+abort('chart-rendered pods must carry the install-wide pull secrets') unless pod['imagePullSecrets'] == [{ 'name' => 'example-pull' }]
+abort('sandboxes must carry their own pull secrets, not the install-wide ones') unless template_pod['imagePullSecrets'] == [{ 'name' => 'example-sandbox-pull' }]
+abort('runtime container must satisfy restricted Pod Security') unless runtime_container['securityContext'] == {
+  'allowPrivilegeEscalation' => false, 'capabilities' => { 'drop' => ['ALL'] }
+}
+runtime_mounts = runtime_container.fetch('volumeMounts').to_h { |item| [item.fetch('name'), item] }
+abort('missing workspace mount') unless runtime_mounts.dig('workspace', 'mountPath') == '/agent'
+abort('missing shim identity mount') unless runtime_mounts.dig('ac-identity', 'mountPath') == '/var/run/ac-identity' && runtime_mounts.dig('ac-identity', 'readOnly')
+identity = template_pod.fetch('volumes').find { |item| item['name'] == 'ac-identity' }
+abort('wrong shim callback token projection') unless identity&.dig('projected', 'sources') == [{
+  'serviceAccountToken' => { 'path' => 'token', 'audience' => 'ac-daemon-callback', 'expirationSeconds' => 3600 }
+}]
+workspace_claim = template_spec.fetch('volumeClaimTemplates').find { |item| item.dig('metadata', 'name') == 'workspace' } || abort('missing workspace volumeClaimTemplate')
+abort('workspace claim must be a 10Gi standard RWO volume') unless workspace_claim.fetch('spec') == {
+  'accessModes' => ['ReadWriteOnce'], 'storageClassName' => 'standard',
+  'resources' => { 'requests' => { 'storage' => '10Gi' } }
+}
+
+warm_pool = find.call('SandboxWarmPool', 'example-agentconnect-runtime-pool')
+abort('warm pool must live with the sandboxes') unless warm_pool.dig('metadata', 'namespace') == 'agentconnect-example-agents'
+abort('warm pool must reference the rendered template') unless warm_pool.dig('spec', 'sandboxTemplateRef', 'name') == 'example-agentconnect-runtime'
+abort('warm pool must hold three spares by default') unless warm_pool.dig('spec', 'replicas') == 3
+abort('warm pool must push template changes to its spares') unless warm_pool.dig('spec', 'updateStrategy', 'type') == 'Recreate'
+abort('warm pool name must match what a daemon-pool member claims against') unless warm_pool.dig('metadata', 'name') == env['AC_K8S_WARM_POOL']
+
+# The orphan reconciler (#1074/#1079): the sweep that used to be a timer inside every member,
+# now a CronJob the cluster schedules. It rides `daemonPool.enabled` because it sweeps that
+# pool's objects with that pool's identity.
+reconciler = find.call('CronJob', 'example-agentconnect-daemon-pool-reconciler')
+reconciler_spec = reconciler.fetch('spec')
+abort('reconciler must sweep every ten minutes') unless reconciler_spec['schedule'] == '*/10 * * * *'
+# `Forbid` IS the mutual exclusion the in-process lease used to provide; two sweeps at once would
+# read one listing and race each other's deletes.
+abort('reconciler must never run two sweeps at once') unless reconciler_spec['concurrencyPolicy'] == 'Forbid'
+abort('a missed reconciler tick must be dropped, not run late') unless reconciler_spec['startingDeadlineSeconds'] == 120
+abort('reconciler must keep one success and three failures') unless [reconciler_spec['successfulJobsHistoryLimit'], reconciler_spec['failedJobsHistoryLimit']] == [1, 3]
+job_spec = reconciler_spec.dig('jobTemplate', 'spec')
+# A failed sweep has a reason a retry ten seconds later does not change, and the deadline is what
+# keeps a hung run from sitting across the next tick and blocking it under `Forbid`.
+abort('a failed sweep must not be retried inside its tick') unless job_spec['backoffLimit'] == 0
+abort('a hung sweep must not outlive its tick') unless job_spec['activeDeadlineSeconds'] == 300
+job_pod = job_spec.dig('template', 'spec')
+abort('reconciler pod must not be restarted in place') unless job_pod['restartPolicy'] == 'Never'
+# The members' identity, so the sweep's cluster rights are exactly their claim Role and its
+# control-plane identity is the same TokenReview subject — nothing extra is granted to sweep.
+abort('reconciler must run as the pool identity') unless job_pod['serviceAccountName'] == 'ac-cloud-daemon'
+abort('reconciler needs the Kubernetes API credential it lists and deletes with') unless job_pod['automountServiceAccountToken'] == true
+abort('reconciler must run under the members security context') unless job_pod['securityContext'] == pod['securityContext']
+reconcile_container = job_pod.fetch('containers').find { |item| item['name'] == 'reconcile' } || abort('missing reconcile container')
+# One image, one tag: the sweep's rules ship with the daemon the members run.
+abort('reconciler must run the daemon image at the pool tag') unless reconcile_container['image'] == container['image']
+# `args` replaces CMD and leaves the image's ENTRYPOINT, which carries the node invocation, so a
+# subcommand is all this states. Pinned because the two sit in different files: an ENTRYPOINT that
+# stopped carrying it would leave this asking tini to exec a binary named `reconcile`.
+abort('reconciler must run exactly one sweep') unless reconcile_container['args'] == ['reconcile', '--once']
+abort('reconciler must satisfy the same container security context') unless reconcile_container['securityContext'] == container['securityContext']
+reconcile_env = reconcile_container.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+# The anti-drift assertion the shared env partial exists for: a sweep pointed at another
+# namespace, warm pool or control plane than the members' silently reads the wrong objects
+# and reports a clean run.
+%w[AC_CP_URL AC_K8S_WARM_POOL AC_K8S_SANDBOX_NAMESPACE AGENTCONNECT_SUPERVISOR].each do |key|
+  abort("reconciler #{key} must match the pool members") unless reconcile_env[key] == env[key]
+end
+# Dry run by default: deleting a claim deletes the agent's workspace PVC and there is no undo, so
+# collection is a value an install flips after watching the summary lines.
+abort('reconciler must ship dry-run') if reconcile_env.key?('AC_K8S_ORPHAN_DELETE')
+abort('reconciler must leave the grace period at the daemon default') if reconcile_env.key?('AC_K8S_ORPHAN_GRACE_MS')
+# Member-only variables have no meaning for a one-shot sweep and must not be implied by the partial.
+%w[AC_K8S_MEMBER_ID AC_POD_TEMPLATE_HASH AC_READINESS_PORT].each do |key|
+  abort("reconciler must not carry the member-only #{key}") if reconcile_container.fetch('env').any? { |item| item['name'] == key }
+end
+reconcile_mounts = reconcile_container.fetch('volumeMounts').to_h { |item| [item.fetch('name'), item] }
+abort('reconciler needs the CP identity mount the members have') unless reconcile_mounts['cp-identity'] == mounts['cp-identity']
+reconcile_token = job_pod.fetch('volumes').find { |item| item['name'] == 'cp-identity' }
+abort('reconciler must present the same projected CP token') unless reconcile_token == volumes['cp-identity']
+# The members' own data plane, read-only. Without it the sweep cannot ask which session pods still
+# have a row (git-workspace-model.md §11), so every one reads as live and nothing reclaims a session
+# pod whose direct teardown failed, and the store retention half is skipped outright. It used to be
+# deliberately absent — "a one-shot sweep holds no agent state" — which read as a clean run while
+# two of the job's three sweeps were silently disabled.
+abort('reconciler needs the data-plane mount its store reads come from') unless reconcile_mounts['data-plane'] == mounts['data-plane']
+reconcile_plane = job_pod.fetch('volumes').find { |item| item['name'] == 'data-plane' }
+abort('reconciler must read the members own data-plane Secret') unless reconcile_plane == volumes['data-plane']
+
+# Collection and the grace period are the two knobs an install turns after its observation window.
+delete_rendered, delete_error, delete_status = Open3.capture3(*(command + [
+  '--set', 'daemonPool.reconciler.delete=true', '--set', 'daemonPool.reconciler.graceMs=1800000'
+]))
+abort("helm template (reconciler deleting) failed:\n#{delete_error}") unless delete_status.success?
+delete_cron = YAML.load_stream(delete_rendered).compact.find do |doc|
+  doc['kind'] == 'CronJob' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool-reconciler'
+end || abort('missing reconciler CronJob with deletion on')
+delete_env = delete_cron.dig('spec', 'jobTemplate', 'spec', 'template', 'spec', 'containers')
+  .find { |item| item['name'] == 'reconcile' }.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+abort('daemonPool.reconciler.delete must enable collection') unless delete_env['AC_K8S_ORPHAN_DELETE'] == 'true'
+abort('daemonPool.reconciler.graceMs must set the grace period') unless delete_env['AC_K8S_ORPHAN_GRACE_MS'] == '1800000'
+
+
+# One chart, one release: the cluster-scoped objects the install needs are rendered here,
+# not by a second chart. They ride `daemonPool.enabled` — see the disabled render at the end.
+cluster_roles = documents.select { |doc| doc['kind'] == 'ClusterRole' }
+abort('chart must own exactly one ClusterRole (the TokenReview grant)') unless cluster_roles.length == 1
+token_review = cluster_roles.first
+abort('TokenReview ClusterRole must be release-prefixed') unless token_review.dig('metadata', 'name') == 'example-agentconnect-ac-tokenreview'
+abort('TokenReview ClusterRole must grant nothing but tokenreviews: create') unless token_review.fetch('rules') == [{
+  'apiGroups' => ['authentication.k8s.io'], 'resources' => ['tokenreviews'], 'verbs' => ['create']
+}]
+cluster_role_bindings = documents.select { |doc| doc['kind'] == 'ClusterRoleBinding' }
+abort('chart must own exactly the two TokenReview bindings') unless cluster_role_bindings.length == 2
+expected_role_ref = { 'apiGroup' => 'rbac.authorization.k8s.io', 'kind' => 'ClusterRole', 'name' => 'example-agentconnect-ac-tokenreview' }
+# The control plane reviews an in-cluster daemon's projected token; a mismatch with the
+# deployed ServiceAccount does not fail a deploy, it 403s every in-cluster registration.
+cp_binding = find.call('ClusterRoleBinding', 'example-agentconnect-ac-tokenreview-control-plane')
+abort('control-plane TokenReview binding has the wrong subject') unless cp_binding['subjects'] == [{
+  'kind' => 'ServiceAccount', 'name' => 'example-agentconnect-control-plane', 'namespace' => 'agentconnect-example'
+}]
+abort('control-plane TokenReview binding uses the wrong role') unless cp_binding['roleRef'] == expected_role_ref
+# `cloud-daemon`, like the ServiceAccount: this binding and its subject are the identity contract.
+pool_binding = find.call('ClusterRoleBinding', 'example-agentconnect-ac-tokenreview-cloud-daemon')
+abort('daemon-pool TokenReview binding has the wrong subject') unless pool_binding['subjects'] == [{
+  'kind' => 'ServiceAccount', 'name' => 'ac-cloud-daemon', 'namespace' => 'agentconnect-example'
+}]
+abort('daemon-pool TokenReview binding uses the wrong role') unless pool_binding['roleRef'] == expected_role_ref
+
+# The agents namespace and its baseline. One value (`daemonPool.sandboxNamespace`) drives both
+# sides, so the namespace the chart creates and the one a pool member claims into cannot differ.
+agents_namespace = find.call('Namespace', 'agentconnect-example-agents')
+namespace_labels = agents_namespace.dig('metadata', 'labels')
+%w[enforce audit warn].each do |mode|
+  abort("agents namespace must #{mode} restricted Pod Security") unless namespace_labels["pod-security.kubernetes.io/#{mode}"] == 'restricted'
+end
+abort('agents namespace must be adoptable and Helm-managed') unless namespace_labels['app.kubernetes.io/managed-by'] == 'Helm'
+abort('agents namespace must survive an uninstall') unless agents_namespace.dig('metadata', 'annotations', 'helm.sh/resource-policy') == 'keep'
+default_deny = find.call('NetworkPolicy', 'example-agentconnect-agents-default-deny')
+abort('default-deny must live in the agents namespace') unless default_deny.dig('metadata', 'namespace') == 'agentconnect-example-agents'
+abort('default-deny must select every pod') unless default_deny.dig('spec', 'podSelector') == {}
+abort('default-deny must deny both directions') unless default_deny.dig('spec', 'policyTypes')&.sort == %w[Egress Ingress]
+abort('default-deny must carry no allow rules') if default_deny.fetch('spec').key?('ingress') || default_deny.fetch('spec').key?('egress')
+# The vendored agent-sandbox stack is cluster-shared: a release told the stack is managed
+# out-of-band must render none of it.
+abort('installCRD=false must render no CRD') if documents.any? { |doc| doc['kind'] == 'CustomResourceDefinition' }
+
+control_plane = find.call('Deployment', 'example-agentconnect-control-plane')
+cp_container = control_plane.dig('spec', 'template', 'spec', 'containers').find { |item| item['name'] == 'control-plane' }
+cp_env = cp_container.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+abort('control plane must carry the daemon-pool switch') unless cp_env['DAEMON_POOL_ENABLED'] == 'true'
+# The switch above is the control plane's whole cluster-access switch; neither the retired
+# CLUSTER_EXECUTION_ENABLED / POOL_NAMESPACE keys nor the envelope seed envs may come back.
+abort('control plane must not render the retired POOL_NAMESPACE') if cp_env.key?('POOL_NAMESPACE')
+abort('control plane must not render retired CLUSTER_* envs') if cp_env.keys.any? { |k| k.start_with?('CLUSTER_') }
+# A replacement CP must take traffic seconds after it listens, and a single replica stay listed through a DB blip.
+abort('control-plane readiness probe timings changed') unless cp_container['readinessProbe'].reject { |key, _| key == 'httpGet' } == {
+  'initialDelaySeconds' => 1, 'periodSeconds' => 2, 'failureThreshold' => 10
+}
+# Migrations run in a hook Job before any new CP pod starts, so a replacement CP never waits on them.
+abort('control plane must not migrate at startup') if control_plane.dig('spec', 'template', 'spec', 'initContainers')
+migrate_job = find.call('Job', 'example-agentconnect-control-plane-migrate')
+abort('migrate Job must run before install and upgrade') unless
+  migrate_job.dig('metadata', 'annotations', 'helm.sh/hook') == 'pre-install,pre-upgrade'
+migrate_pod = migrate_job.dig('spec', 'template', 'spec')
+abort('migrate Job must export the CP schema, then migrate') unless
+  migrate_pod['initContainers'].map { |c| c['name'] } == ['export-prisma-files'] &&
+  migrate_pod['containers'].map { |c| c['name'] } == ['migrate']
+abort('migrate Job must read DATABASE_URL from the Secret') unless migrate_pod['containers'][0]['env'].include?(
+  'name' => 'DATABASE_URL', 'valueFrom' => { 'secretKeyRef' => { 'name' => 'agentconnect-secrets', 'key' => 'DATABASE_URL' } }
+)
+no_migrate_rendered, no_migrate_error, no_migrate_status = Open3.capture3(*command, '--set', 'migrate.enabled=false')
+abort("helm template (migrate off) failed:\n#{no_migrate_error}") unless no_migrate_status.success?
+abort('migrate.enabled=false must render no migrate Job') if YAML.load_stream(no_migrate_rendered).compact.any? do |doc|
+  doc['kind'] == 'Job' && doc.dig('metadata', 'name') == 'example-agentconnect-control-plane-migrate'
+end
+# At one replica a PDB blocks every voluntary eviction, so it is opt-in and keeps the one CP pod.
+abort('control-plane PDB must be opt-in') if documents.any? { |doc| doc['kind'] == 'PodDisruptionBudget' && doc.dig('metadata', 'name') == 'example-agentconnect-control-plane' }
+pdb_rendered, pdb_error, pdb_status = Open3.capture3(*command, '--set', 'controlPlane.podDisruptionBudget=true')
+abort("helm template (control-plane PDB) failed:\n#{pdb_error}") unless pdb_status.success?
+cp_pdb = YAML.load_stream(pdb_rendered).compact.find do |doc|
+  doc['kind'] == 'PodDisruptionBudget' && doc.dig('metadata', 'name') == 'example-agentconnect-control-plane'
+end || abort('missing control-plane PDB')
+abort('control-plane PDB must keep the one CP pod') unless cp_pdb['spec'] == {
+  'minAvailable' => 1, 'selector' => { 'matchLabels' => control_plane.dig('spec', 'selector', 'matchLabels') }
+}
+
+# An install with the switch off must not grow a single cluster-scoped object just because the
+# chart carries them: in-cluster daemons are the only thing that presents a projected token,
+# and an install without a pool has none.
+disabled_command = command + ['--set', 'daemonPool.enabled=false']
+disabled_rendered, disabled_error, disabled_status = Open3.capture3(*disabled_command)
+abort("helm template (no daemon pool) failed:\n#{disabled_error}") unless disabled_status.success?
+disabled_documents = YAML.load_stream(disabled_rendered).compact
+%w[ClusterRole ClusterRoleBinding Namespace NetworkPolicy].each do |kind|
+  abort("an install without a daemon pool must render no #{kind}") if disabled_documents.any? { |doc| doc['kind'] == kind }
+end
+# The reconciler sweeps the pool's own objects, so an install without a pool must not schedule it.
+abort('an install without a daemon pool must render no reconciler CronJob') if disabled_documents.any? { |doc|
+  doc['kind'] == 'CronJob' && doc.dig('metadata', 'name').to_s.end_with?('-daemon-pool-reconciler')
+}
+
+# A single-namespace install keeps sandboxes in the release namespace; the chart must not
+# then try to create (or adopt) the namespace it is already deployed in.
+same_namespace_command = command + ['--set', 'daemonPool.sandboxNamespace=agentconnect-example']
+same_rendered, same_error, same_status = Open3.capture3(*same_namespace_command)
+abort("helm template (sandboxes in the release namespace) failed:\n#{same_error}") unless same_status.success?
+abort('the chart must not render its own release namespace') if YAML.load_stream(same_rendered).compact.any? { |doc| doc['kind'] == 'Namespace' }
+
+# The vendored agent-sandbox CONTROLLER stack, behind installCRD (the CRDs ride crds/ and
+# are asserted above). `helm template --set installCRD=true --show-only
+# templates/agent-sandbox.yaml` is also how the stack is applied out-of-band.
+vendored_rendered, vendored_error, vendored_status = Open3.capture3(*(command + ['--set', 'installCRD=true']))
+abort("helm template (installCRD) failed:\n#{vendored_error}") unless vendored_status.success?
+vendored_documents = YAML.load_stream(vendored_rendered).compact
+abort('the controller stack must template no CRD (crds/ owns them)') if vendored_documents.any? { |doc| doc['kind'] == 'CustomResourceDefinition' }
+abort('installCRD must render the controller Deployment') unless vendored_documents.any? { |doc| doc['kind'] == 'Deployment' && doc.dig('metadata', 'namespace') == 'agent-sandbox-system' }
+# Without this ConfigMap the controller rejects every claim the daemon makes as InvalidMetadata.
+allowlist = vendored_documents.find { |doc| doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == 'agent-sandbox-config' } ||
+            abort('installCRD must render the controller label allowlist')
+abort('label allowlist must name both domains') unless allowlist.dig('data', 'allowed-label-domains') == 'sandbox.users.io,agentconnect.md'
+
+# ── the batteries-included defaults: a bare install carries the whole product ──
+# Pure defaults, no values at all: the daemon pool (three warm spares) and open-connector
+# render; the relay is enabled but WAITS for a public host (below). Turning a component off
+# is the consumer's explicit values choice, not a discovery.
+defaults_rendered, defaults_error, defaults_status = Open3.capture3(
+  'helm', 'template', 'example-agentconnect', chart, '--namespace', 'agentconnect-example'
+)
+abort("helm template (pure defaults) failed:\n#{defaults_error}") unless defaults_status.success?
+defaults_documents = YAML.load_stream(defaults_rendered).compact
+defaults_find = lambda do |kind, name|
+  defaults_documents.find { |doc| doc['kind'] == kind && doc.dig('metadata', 'name') == name } ||
+    abort("defaults must render #{kind}/#{name}")
+end
+default_pool = defaults_find.call('Deployment', 'example-agentconnect-daemon-pool')
+default_oc = defaults_find.call('Deployment', 'example-agentconnect-open-connector')
+default_warm = defaults_find.call('SandboxWarmPool', 'example-agentconnect-runtime-pool')
+abort('defaults must hold three warm spares') unless default_warm.dig('spec', 'replicas') == 3
+# The runtime-sandbox image is public, so the sandbox pull secrets stay empty until an install
+# hosting it privately sets them — and an empty list must render no key at all, not `null`.
+default_template_pod = defaults_find.call('SandboxTemplate', 'example-agentconnect-runtime').dig('spec', 'podTemplate', 'spec')
+abort('defaults must name no sandbox pull secrets') if default_template_pod.key?('imagePullSecrets')
+# The pool's data-plane Secret is referenced by a default NAME the operator creates, like
+# `secrets.existingSecret` — a required-but-empty value would fail the default render outright.
+default_data_plane = default_pool.dig('spec', 'template', 'spec', 'volumes').find { |v| v['name'] == 'data-plane' }
+abort('defaults must reference the documented data-plane Secret name') unless default_data_plane.dig('secret', 'secretName') == 'agentconnect-data-plane'
+# The default-on third-party component must not ride upstream's mutable `latest`: the chart pins a release tag, moved deliberately by chart releases.
+default_oc_container = default_oc.dig('spec', 'template', 'spec', 'containers').first
+abort('open-connector default must pin a release tag') unless default_oc_container['image'].match?(/:v\d+\.\d+\.\d+$/)
+abort('a pinned tag must not force re-pulls') unless default_oc_container['imagePullPolicy'] == 'IfNotPresent'
+# The relay is enabled by default but every public-host input is empty, so it must render
+# NOTHING — an origin like "https://" or "wss:///relays/…" is worse than absence — and the
+# CP must not then demand a RELAY_TOKEN nothing can dial with.
+abort('a hostless default must render no relay') if defaults_documents.any? { |doc| doc['kind'] == 'StatefulSet' && doc.dig('metadata', 'name').to_s.include?('relay') }
+defaults_cp = defaults_find.call('Deployment', 'example-agentconnect-control-plane')
+defaults_cp_env = defaults_cp.dig('spec', 'template', 'spec', 'containers').first.fetch('env').map { |item| item['name'] }
+%w[PUBLIC_RELAY_URL RELAY_TOKEN].each do |key|
+  abort("a hostless default must not give the CP #{key}") if defaults_cp_env.include?(key)
+end
+# The CRDs are NOT templated: they ship in crds/, which Helm applies on first install
+# before resolving the templated SandboxTemplate/SandboxWarmPool — a templated CRD would
+# fail a fresh cluster at discovery, before anything applies.
+abort('defaults must template no CRD') if defaults_documents.any? { |doc| doc['kind'] == 'CustomResourceDefinition' }
+crds_file = YAML.load_stream(File.read(File.join(chart, 'crds/agent-sandbox.yaml'))).compact
+abort('crds/ must carry the four vendored agent-sandbox CRDs') unless crds_file.count { |doc| doc['kind'] == 'CustomResourceDefinition' } == 4
+abort('vendored CRDs must survive an uninstall') unless crds_file.all? { |doc| doc.dig('metadata', 'annotations', 'helm.sh/resource-policy') == 'keep' }
+
+# ── the published-artifact defaults: no tag set means the chart's own release ──
+# The release pipeline stamps appVersion; with image.tag empty by default, installing chart
+# X.Y.Z runs that release's images. A non-empty tag default would silently pin every install
+# to a mutable reference the stamp never touches.
+untagged = command.each_slice(2).reject { |flag, value| flag == '--set' && value.to_s.start_with?('image.tag=') }.flatten
+untagged_rendered, untagged_error, untagged_status = Open3.capture3(*untagged)
+abort("helm template (no image.tag) failed:\n#{untagged_error}") unless untagged_status.success?
+untagged_cp = YAML.load_stream(untagged_rendered).compact.find do |doc|
+  doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-control-plane'
+end || abort('missing control-plane Deployment in the untagged render')
+untagged_image = untagged_cp.dig('spec', 'template', 'spec', 'containers').find { |c| c['name'] == 'control-plane' }['image']
+abort("image.tag unset must fall back to Chart.appVersion, got #{untagged_image}") unless untagged_image.end_with?(':v0.0.0-dev')
+
+# ── the public-surface renders: same-origin setup URLs and the relay's ingress paths ──
+public_rendered, public_error, public_status = Open3.capture3(
+  'helm', 'template', 'example-agentconnect', chart, '--namespace', 'agentconnect-example',
+  '--set', 'publicUrl=https://app.example.test', '--set', 'relay.enabled=true'
+)
+abort("helm template (publicUrl + relay) failed:\n#{public_error}") unless public_status.success?
+public_documents = YAML.load_stream(public_rendered).compact
+# With a public host resolvable the default-on relay renders, and every origin it and the
+# CP advertise is a real one — the assertions the hostless render above holds in absence.
+public_relay = public_documents.find { |doc| doc['kind'] == 'StatefulSet' && doc.dig('metadata', 'name') == 'example-agentconnect-relay' } ||
+               abort('relay must render once a public host resolves')
+public_relay_env = public_relay.dig('spec', 'template', 'spec', 'containers').first.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+abort('relay must dial back through the resolved public host') unless public_relay_env['DAEMON_DIAL_URL'] == 'wss://app.example.test/relays/$(POD_INDEX)'
+public_cp = public_documents.find { |doc| doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-control-plane' } ||
+            abort('missing control-plane Deployment in the public render')
+public_cp_env = public_cp.dig('spec', 'template', 'spec', 'containers').first.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+abort('CP must advertise the resolved relay origin') unless public_cp_env['PUBLIC_RELAY_URL'] == 'https://app.example.test'
+setup = public_documents.find { |doc| doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-setup-server' } ||
+        abort('missing setup-server Deployment in the public render')
+setup_env = setup.dig('spec', 'template', 'spec', 'containers').first.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+# Setup Server derives the provider callback/setup URLs it hands out from this; omitted, it
+# falls back to its loopback origin and every generated URL points at the operator's
+# port-forward. Same derivation as the CP's PUBLIC_CP_URL, in both routing modes.
+abort('setup server must carry the same-origin public CP base') unless setup_env['AGENTCONNECT_PUBLIC_CP_URL'] == 'https://app.example.test/cp'
+relay_route = public_documents.find { |doc| doc['kind'] == 'HTTPRoute' && doc.dig('metadata', 'name') == 'example-agentconnect-relay' } ||
+              abort('missing relay HTTPRoute in the public render')
+relay_paths = relay_route.dig('spec', 'rules').flat_map { |rule| rule['matches'].to_a }.map { |match| match.dig('path', 'value') }
+# Every HTTP ingress path the relay registry mounts; a path the route omits falls through to
+# the web catch-all (or the gateway 404) and that platform's ingress silently receives nothing.
+%w[/mcp /memory /webchat /webhooks/in /webhooks/github /webhooks/gitlab /webhooks/gitea /slack/events /slack/interactions /feishu/events /linear/events /googlechat/events /ai-sdk/agents /ag-ui/agents].each do |path|
+  abort("relay route must forward #{path}") unless relay_paths.include?(path)
+end
+
+# ONE safety window. The sweep calls a claim orphaned once nothing has touched it for this long, and a
+# member re-stamps the claims it holds on a cadence derived from the same number — so the value has to
+# reach BOTH surfaces from one place. A member reading a different grace than the job sweeping after it
+# would let a claim in use age past the window between two of its own ticks, and the sweep would then
+# delete a live pod's volume.
+grace_rendered, grace_error, grace_status = Open3.capture3(*(command + ['--set', 'daemonPool.reconciler.graceMs=90000']))
+abort("helm template (orphan grace) failed:\n#{grace_error}") unless grace_status.success?
+grace_documents = YAML.load_stream(grace_rendered).compact
+grace_env = lambda do |kind, name, path|
+  doc = grace_documents.find { |item| item['kind'] == kind && item.dig('metadata', 'name') == name } ||
+        abort("missing #{kind}/#{name} in the orphan-grace render")
+  doc.dig(*path).fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+end
+member_grace = grace_env.call('Deployment', 'example-agentconnect-daemon-pool',
+                              ['spec', 'template', 'spec', 'containers', 0])
+sweep_grace = grace_env.call('CronJob', 'example-agentconnect-daemon-pool-reconciler',
+                             ['spec', 'jobTemplate', 'spec', 'template', 'spec', 'containers', 0])
+abort('pool members must read the same orphan grace the sweep does') unless member_grace['AC_K8S_ORPHAN_GRACE_MS'] == '90000'
+abort('the orphan sweep must read the configured grace') unless sweep_grace['AC_K8S_ORPHAN_GRACE_MS'] == '90000'
+# Unset is the shared default on both, never one side defaulting while the other is configured.
+default_member = find.call('Deployment', 'example-agentconnect-daemon-pool')
+                     .dig('spec', 'template', 'spec', 'containers', 0).fetch('env').map { |item| item.fetch('name') }
+abort('an unset grace must leave both sides on the daemon default') if default_member.include?('AC_K8S_ORPHAN_GRACE_MS')
+
+# ── Source Cache (source-cache.md §12): off by default, member-only, credentials never in a pod ──
+pool_member = lambda do |docs|
+  deployment = docs.find { |doc| doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool' } ||
+               abort('missing daemon-pool Deployment')
+  pod_spec = deployment.dig('spec', 'template', 'spec')
+  [pod_spec, pod_spec.fetch('containers').find { |item| item['name'] == 'daemon-pool' }]
+end
+source_cache_free = lambda do |label, pod_spec, containers|
+  abort("#{label} must carry no Source Cache volume") if pod_spec.fetch('volumes', []).any? { |v| v['name'].start_with?('source-cache') }
+  containers.each do |c|
+    names = c.fetch('env', []).map { |item| item.fetch('name') }
+    abort("#{label} must carry no AC_SOURCE_CACHE") if names.include?('AC_SOURCE_CACHE')
+    abort("#{label} must carry no AWS_* credentials") if names.any? { |name| name.start_with?('AWS_') }
+    abort("#{label} must mount no Source Cache volume") if c.fetch('volumeMounts', []).any? { |m| m['name'].start_with?('source-cache') }
+  end
+end
+[['base', documents], ['pure defaults', defaults_documents]].each do |label, docs|
+  pod_spec, member = pool_member.call(docs)
+  source_cache_free.call("the #{label} member", pod_spec, [member])
+end
+
+source_cache_base = command + [
+  '--set', 'sourceCache.enabled=true',
+  '--set', 'sourceCache.endpoint=https://minio.example.test',
+  '--set', 'sourceCache.region=us-east-1',
+  '--set', 'sourceCache.bucket=ac-cache',
+  '--set', 'sourceCache.prefix=agentconnect'
+]
+secret_rendered, secret_error, secret_status = Open3.capture3(
+  *source_cache_base,
+  '--set', 'sourceCache.forcePathStyle=true',
+  '--set', 'sourceCache.credentials.source=secret',
+  '--set', 'sourceCache.credentials.secret.name=example-source-cache'
+)
+abort("helm template (Source Cache secret) failed:\n#{secret_error}") unless secret_status.success?
+secret_documents = YAML.load_stream(secret_rendered).compact
+secret_pod, secret_member = pool_member.call(secret_documents)
+secret_env = secret_member.fetch('env').to_h { |item| [item.fetch('name'), item['value']] }
+source_cache_doc = JSON.parse(secret_env['AC_SOURCE_CACHE'] || abort('an enabled Source Cache must reach the member'))
+abort("unexpected Source Cache document: #{source_cache_doc}") unless source_cache_doc == {
+  'version' => 1, 'endpoint' => 'https://minio.example.test', 'region' => 'us-east-1', 'bucket' => 'ac-cache',
+  'prefix' => 'agentconnect', 'forcePathStyle' => true,
+  'credentials' => {
+    'source' => 'static', 'dir' => '/var/run/ac-source-cache',
+    'accessKeyIdKey' => 'AWS_ACCESS_KEY_ID', 'secretAccessKeyKey' => 'AWS_SECRET_ACCESS_KEY'
+  },
+  'limits' => {
+    'maxBundleBytes' => '2Gi', 'orgQuotaBytes' => '20Gi', 'pendingReservationSeconds' => '1h',
+    'unreadPointerDays' => 30, 'getUrlSeconds' => '5m', 'putUrlSeconds' => '15m'
+  }
+}
+# Console file transfer: the Control Plane signs every URL for the same bucket, with the same credential source.
+control_plane_of = lambda do |docs|
+  deployment = docs.find { |doc| doc['kind'] == 'Deployment' && doc.dig('metadata', 'name') == 'example-agentconnect-control-plane' } ||
+               abort('missing control-plane Deployment')
+  pod_spec = deployment.dig('spec', 'template', 'spec')
+  [pod_spec, pod_spec.fetch('containers').find { |item| item['name'] == 'control-plane' }]
+end
+transfer_doc_of = lambda do |container|
+  value = container.fetch('env').find { |item| item['name'] == 'AC_FILE_TRANSFER' }&.fetch('value')
+  value && JSON.parse(value)
+end
+secret_cp_pod, secret_cp = control_plane_of.call(secret_documents)
+abort("unexpected file transfer document: #{transfer_doc_of.call(secret_cp)}") unless transfer_doc_of.call(secret_cp) == {
+  'version' => 1, 'endpoint' => 'https://minio.example.test', 'region' => 'us-east-1', 'bucket' => 'ac-cache',
+  'prefix' => 'agentconnect', 'forcePathStyle' => true,
+  'credentials' => {
+    'source' => 'static', 'dir' => '/var/run/ac-source-cache',
+    'accessKeyIdKey' => 'AWS_ACCESS_KEY_ID', 'secretAccessKeyKey' => 'AWS_SECRET_ACCESS_KEY'
+  },
+  'limits' => { 'maxBytes' => '512Mi', 'urlSeconds' => '30m', 'putUrlSeconds' => '15m' }
+}
+abort('the control plane must mount the bucket Secret read-only at 0400') unless
+  secret_cp_pod.fetch('volumes').include?({ 'name' => 'source-cache-credentials', 'secret' => { 'secretName' => 'example-source-cache', 'defaultMode' => 0o400 } }) &&
+  secret_cp.fetch('volumeMounts').include?({ 'name' => 'source-cache-credentials', 'mountPath' => '/var/run/ac-source-cache', 'readOnly' => true })
+secret_volume = secret_pod.fetch('volumes').find { |v| v['name'] == 'source-cache-credentials' } ||
+                abort('the secret source must mount its Secret')
+abort('the Source Cache Secret must be mounted whole at 0400') unless
+  secret_volume['secret'] == { 'secretName' => 'example-source-cache', 'defaultMode' => 0o400 }
+secret_mount = secret_member.fetch('volumeMounts').find { |m| m['name'] == 'source-cache-credentials' }
+abort('the Source Cache Secret must be mounted read-only') unless
+  secret_mount == { 'name' => 'source-cache-credentials', 'mountPath' => '/var/run/ac-source-cache', 'readOnly' => true }
+abort('static keys must arrive as files, never env') if secret_member.fetch('env').any? { |item|
+  item['name'].start_with?('AWS_') || item.dig('valueFrom', 'secretKeyRef', 'name') == 'example-source-cache'
+}
+abort('the secret source must not project a web identity') if secret_pod.fetch('volumes').any? { |v| v['name'] == 'source-cache-identity' }
+secret_template = secret_documents.find { |doc| doc['kind'] == 'SandboxTemplate' && doc.dig('metadata', 'name') == 'example-agentconnect-runtime' } ||
+                  abort('missing SandboxTemplate in the Source Cache render')
+template_pod = secret_template.dig('spec', 'podTemplate', 'spec')
+source_cache_free.call('the runtime SandboxTemplate', template_pod, template_pod.fetch('containers') + template_pod.fetch('initContainers', []))
+secret_reconciler = secret_documents.find { |doc| doc['kind'] == 'CronJob' && doc.dig('metadata', 'name') == 'example-agentconnect-daemon-pool-reconciler' } ||
+                    abort('missing reconciler CronJob in the Source Cache render')
+reconciler_pod = secret_reconciler.dig('spec', 'jobTemplate', 'spec', 'template', 'spec')
+source_cache_free.call('the reconciler', reconciler_pod, reconciler_pod.fetch('containers'))
+
+identity_rendered, identity_error, identity_status = Open3.capture3(
+  *source_cache_base,
+  '--set', 'sourceCache.credentials.serviceAccount.roleArn=arn:aws:iam::123456789012:role/ac-source-cache'
+)
+abort("helm template (Source Cache web identity) failed:\n#{identity_error}") unless identity_status.success?
+identity_pod, identity_member = pool_member.call(YAML.load_stream(identity_rendered).compact)
+identity_doc = JSON.parse(identity_member.fetch('env').find { |item| item['name'] == 'AC_SOURCE_CACHE' }&.fetch('value') ||
+                          abort('the web identity form must reach the member'))
+abort("unexpected web identity credentials: #{identity_doc['credentials']}") unless identity_doc['credentials'] == {
+  'source' => 'webIdentity', 'roleArn' => 'arn:aws:iam::123456789012:role/ac-source-cache',
+  'tokenFile' => '/var/run/ac-source-cache-identity/token'
+}
+identity_volume = identity_pod.fetch('volumes').find { |v| v['name'] == 'source-cache-identity' } ||
+                  abort('a roleArn must project the member web identity token')
+abort('the web identity token must carry the STS audience') unless identity_volume.dig('projected', 'sources') == [{
+  'serviceAccountToken' => { 'path' => 'token', 'audience' => 'sts.amazonaws.com', 'expirationSeconds' => 3600 }
+}]
+abort('the web identity token must be mounted read-only') unless identity_member.fetch('volumeMounts').any? { |m|
+  m == { 'name' => 'source-cache-identity', 'mountPath' => '/var/run/ac-source-cache-identity', 'readOnly' => true }
+}
+abort('the web identity form must mount no Secret') if identity_pod.fetch('volumes').any? { |v| v['name'] == 'source-cache-credentials' }
+identity_cp_pod, identity_cp = control_plane_of.call(YAML.load_stream(identity_rendered).compact)
+abort('the control plane signs transfers with the same web identity') unless
+  transfer_doc_of.call(identity_cp)['credentials'] == identity_doc['credentials'] &&
+  identity_cp_pod.fetch('volumes').any? { |v| v['name'] == 'source-cache-identity' } &&
+  identity_cp.fetch('volumeMounts').include?({ 'name' => 'source-cache-identity', 'mountPath' => '/var/run/ac-source-cache-identity', 'readOnly' => true })
+abort('an unset publicEndpoint must not reach the control plane') if transfer_doc_of.call(identity_cp).key?('publicEndpoint')
+
+session_rendered, session_error, session_status = Open3.capture3(
+  *source_cache_base,
+  '--set', 'sourceCache.credentials.serviceAccount.sessionDurationSeconds=7200',
+  '--set', 'sourceCache.limits.transferUrlLifetime=90m'
+)
+abort("helm template (Source Cache session duration) failed:\n#{session_error}") unless session_status.success?
+session_documents = YAML.load_stream(session_rendered).compact
+_, session_member = pool_member.call(session_documents)
+_, session_cp = control_plane_of.call(session_documents)
+abort('a pinned STS session and the transfer link lifetime must reach the control plane') unless
+  transfer_doc_of.call(session_cp).dig('credentials', 'durationSeconds') == 7200 &&
+  transfer_doc_of.call(session_cp).dig('limits', 'urlSeconds') == '90m'
+session_doc = JSON.parse(session_member.fetch('env').find { |item| item['name'] == 'AC_SOURCE_CACHE' }&.fetch('value') ||
+                         abort('the session duration form must reach the member'))
+abort("a pinned STS session must reach the member: #{session_doc['credentials']}") unless
+  session_doc.dig('credentials', 'durationSeconds') == 7200
+
+public_rendered, public_error, public_status = Open3.capture3(
+  *source_cache_base, '--set', 'sourceCache.publicEndpoint=https://store.example.test'
+)
+abort("helm template (Source Cache public endpoint) failed:\n#{public_error}") unless public_status.success?
+public_documents_sc = YAML.load_stream(public_rendered).compact
+_, public_member = pool_member.call(public_documents_sc)
+_, public_cp_container = control_plane_of.call(public_documents_sc)
+abort('the public endpoint is the signer’s, not the member’s') if
+  JSON.parse(public_member.fetch('env').find { |item| item['name'] == 'AC_SOURCE_CACHE' }.fetch('value')).key?('publicEndpoint')
+abort("unexpected publicEndpoint: #{transfer_doc_of.call(public_cp_container)}") unless
+  transfer_doc_of.call(public_cp_container)['publicEndpoint'] == 'https://store.example.test'
+_, plain_cp = control_plane_of.call(documents)
+abort('a disabled Source Cache must give the control plane no transfer bucket') if transfer_doc_of.call(plain_cp) || plain_cp.key?('volumeMounts')
+
+[
+  [['--set', 'sourceCache.enabled=true', '--set', 'sourceCache.region=us-east-1'], 'sourceCache.bucket is required'],
+  [source_cache_base + ['--set', 'sourceCache.credentials.source=secret'], 'secret.name is required'],
+  [source_cache_base + ['--set', 'sourceCache.endpoint=http://minio.example.test'], 'https://'],
+  [source_cache_base + ['--set', 'sourceCache.publicEndpoint=http://store.example.test'], 'publicEndpoint must be an https://'],
+  [source_cache_base + ['--set', 'sourceCache.credentials.source=static'], 'serviceAccount or secret'],
+  [source_cache_base + ['--set', 'daemonPool.extraEnv.AC_SOURCE_CACHE={}'], 'AC_SOURCE_CACHE collides'],
+  [source_cache_base + ['--set', 'controlPlane.extraEnv.AC_FILE_TRANSFER={}'], 'AC_FILE_TRANSFER collides']
+].each do |extra, expected|
+  args = extra.first == '--set' ? command + extra : extra
+  _, refused, refused_status = Open3.capture3(*args)
+  abort("Source Cache render must be refused (#{expected})") if refused_status.success?
+  abort("Source Cache refusal must say #{expected}:\n#{refused}") unless refused.include?(expected)
+end
+
+# ── Bundled store: absent until it has a host, then members and the Control Plane read its key pair as mounted files ──
+store_name = 'example-agentconnect-source-cache-store'
+store_docs_of = ->(docs) { docs.select { |doc| doc.dig('metadata', 'name').to_s.start_with?(store_name) } }
+abort('the bundled store must not render without a host') unless store_docs_of.call(documents).empty? && store_docs_of.call(defaults_documents).empty?
+store_rendered, store_error, store_status = Open3.capture3(
+  *command, '--set', 'sourceCache.store.host=objects.example.test', '--set', 'sourceCache.prefix=agentconnect',
+  '--set', 'publicUrl=https://console.example.test'
+)
+abort("helm template (bundled store) failed:\n#{store_error}") unless store_status.success?
+store_documents = YAML.load_stream(store_rendered).compact
+store_kinds = store_docs_of.call(store_documents).map { |doc| [doc['kind'], doc.dig('metadata', 'name')] }.sort
+abort("unexpected bundled store objects: #{store_kinds}") unless store_kinds == [
+  ['ConfigMap', "#{store_name}-setup"], ['HTTPRoute', store_name], ['Job', "#{store_name}-setup"],
+  ['Secret', store_name], ['Service', store_name], ['StatefulSet', store_name]
+].sort
+store_bucket = {
+  'version' => 1, 'endpoint' => 'https://objects.example.test', 'region' => 'us-east-1',
+  'bucket' => 'agentconnect-source-cache', 'prefix' => 'agentconnect', 'forcePathStyle' => true,
+  'credentials' => {
+    'source' => 'static', 'dir' => '/var/run/ac-source-cache',
+    'accessKeyIdKey' => 'AWS_ACCESS_KEY_ID', 'secretAccessKeyKey' => 'AWS_SECRET_ACCESS_KEY'
+  }
+}
+store_pod, store_member = pool_member.call(store_documents)
+store_member_doc = JSON.parse(store_member.fetch('env').find { |item| item['name'] == 'AC_SOURCE_CACHE' }&.fetch('value') ||
+                              abort('the bundled store must turn the Source Cache on for members'))
+abort("unexpected bundled store member document: #{store_member_doc}") unless store_member_doc.reject { |k, _| k == 'limits' } == store_bucket
+store_cp_pod, store_cp = control_plane_of.call(store_documents)
+abort("unexpected bundled store transfer document: #{transfer_doc_of.call(store_cp)}") unless
+  transfer_doc_of.call(store_cp)&.reject { |k, _| k == 'limits' } == store_bucket
+store_volume = { 'name' => 'source-cache-credentials', 'secret' => { 'secretName' => store_name, 'defaultMode' => 0o400 } }
+abort('members and the Control Plane must mount the store Secret') unless
+  store_pod.fetch('volumes').include?(store_volume) && store_cp_pod.fetch('volumes').include?(store_volume)
+abort('store keys must reach members and the Control Plane as files, never env') if [store_member, store_cp].any? do |c|
+  c.fetch('env').any? { |item| item.dig('valueFrom', 'secretKeyRef', 'name') == store_name }
+end
+store_route = store_documents.find { |doc| doc['kind'] == 'HTTPRoute' && doc.dig('metadata', 'name') == store_name }
+abort('the store route must serve its host from the store Service') unless
+  store_route.dig('spec', 'hostnames') == ['objects.example.test'] &&
+  store_route.dig('spec', 'rules', 0, 'backendRefs') == [{ 'name' => store_name, 'port' => 9000 }]
+store_job = store_documents.find { |doc| doc['kind'] == 'Job' && doc.dig('metadata', 'name') == "#{store_name}-setup" }
+store_cors = store_job.dig('spec', 'template', 'spec', 'containers', 0, 'env').find { |item| item['name'] == 'AC_STORE_CORS_ORIGIN' }
+abort('the store must admit the console origin') unless store_cors && store_cors['value'] == 'https://console.example.test'
+store_script = store_documents.find { |doc| doc['kind'] == 'ConfigMap' && doc.dig('metadata', 'name') == "#{store_name}-setup" }
+abort('the setup Job must run the shared setup script') unless
+  store_script.dig('data', 'object-store-setup.sh') == File.read(File.join(chart, 'files', 'object-store-setup.sh')).chomp
+# An external bucket takes precedence over the bundled store.
+external_rendered, external_error, external_status = Open3.capture3(*source_cache_base, '--set', 'sourceCache.store.host=objects.example.test')
+abort("helm template (external over store) failed:\n#{external_error}") unless external_status.success?
+abort('an external bucket must leave the bundled store unrendered') unless store_docs_of.call(YAML.load_stream(external_rendered).compact).empty?
+_, store_refused, store_refused_status = Open3.capture3(*command, '--set', 'sourceCache.store.host=https://objects.example.test')
+abort('a store host with a scheme must be refused') if store_refused_status.success? || !store_refused.include?('bare hostname')
+_, no_origin, no_origin_status = Open3.capture3(*command, '--set', 'sourceCache.store.host=objects.example.test')
+abort('a store without publicUrl must be refused') if no_origin_status.success? || !no_origin.include?('publicUrl is required')
+
+puts 'chart render contract: ok'

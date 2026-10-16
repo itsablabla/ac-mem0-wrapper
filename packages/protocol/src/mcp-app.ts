@@ -1,0 +1,155 @@
+// ⚠️ NO RELATIVE IMPORTS — a bundler compiles this from source; web's protocol-imports.leaf.test.ts enforces it.
+import { z } from 'zod'
+
+export const INTEGRATION_SETUP_URI = 'ui://agentconnect/integration-setup'
+export const IntegrationSetupIntent = z.discriminatedUnion('mode', [
+  z
+    .object({
+      mode: z.literal('create'),
+      provider: z.string().min(1).max(64).optional(),
+      agentId: z.string().uuid().optional()
+    })
+    .strict(),
+  z
+    .object({
+      mode: z.literal('edit'),
+      agentId: z.string().uuid(),
+      target: z.object({ kind: z.enum(['integration', 'codehost-subscription']), id: z.string().uuid() }).strict()
+    })
+    .strict()
+])
+export type IntegrationSetupIntent = z.infer<typeof IntegrationSetupIntent>
+
+export const CODE_HOST_SETUP_URI = 'ui://agentconnect/code-host-setup'
+// Redeclared rather than imported from `./code-host`: this module is a leaf (see the banner).
+export const CODE_HOST_SETUP_PROVIDERS = ['github', 'gitlab', 'gitea'] as const
+// Which card the connection surface opens on; omitted means the whole surface, as the Console page shows it.
+export const CodeHostSetupIntent = z.object({ provider: z.enum(CODE_HOST_SETUP_PROVIDERS).optional() }).strict()
+export type CodeHostSetupIntent = z.infer<typeof CodeHostSetupIntent>
+
+export const AGENT_SETUP_URI = 'ui://agentconnect/agent-setup'
+// The groups of the Console agent editor; omitted opens on its first one.
+export const AGENT_SETUP_SECTIONS = ['basics', 'runtime', 'access', 'secrets'] as const
+// What a delegated `createAgent` PROPOSES: the arguments it collected, carried to the Console create
+// dialog prefilled instead of written, so the human submits the agent under their own Console JWT.
+// Bounds mirror the tool's own — the card's byte budget is what caps a drafted string.
+export const AgentSetupDraft = z
+  .object({
+    name: z.string().min(1).max(63),
+    displayName: z.string().min(1).optional(),
+    description: z.string().optional(),
+    runtime: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+    reasoningEffort: z.string().min(1).optional(),
+    outputMode: z.enum(['none', 'minimal', 'low', 'medium', 'high']).optional(),
+    fastMode: z.boolean().optional(),
+    permissionMode: z.string().min(1).optional(),
+    placementKind: z.enum(['daemon', 'pool', 'set']).optional(),
+    setId: z.string().uuid().optional(),
+    daemonId: z.string().min(1).optional(),
+    workspace: z
+      .object({
+        mode: z.enum(['scratch', 'git']),
+        gitRepo: z.string().min(1).optional(),
+        gitBranch: z.string().min(1).optional(),
+        agentDir: z.string().min(1).optional(),
+        worktree: z.boolean().optional(),
+        access: z.enum(['read', 'write']).optional()
+      })
+      .strict()
+      .optional()
+  })
+  .strict()
+export type AgentSetupDraft = z.infer<typeof AgentSetupDraft>
+
+export const AgentSetupIntent = z
+  .object({
+    agentId: z.string().uuid().optional(),
+    section: z.enum(AGENT_SETUP_SECTIONS).optional(),
+    // Set by a direct `createAgent`, whose card is the new agent's own next step rather than an edit of an old one.
+    created: z.boolean().optional(),
+    // Set by a delegated `createAgent`: no agent exists yet, and the dialog opens prefilled on this proposal.
+    draft: AgentSetupDraft.optional()
+  })
+  .strict()
+  // An editor needs its subject and a create dialog has none — one intent is never both.
+  .refine((intent) => (intent.agentId === undefined) !== (intent.draft === undefined), {
+    message: 'exactly one of agentId or draft'
+  })
+export type AgentSetupIntent = z.infer<typeof AgentSetupIntent>
+
+export const SKILL_SETUP_URI = 'ui://agentconnect/skill-setup'
+// `registry` searches skills.sh by name; `git` imports a repository. Omitted takes the registry.
+export const SKILL_SETUP_SOURCES = ['registry', 'git'] as const
+export const SkillSetupIntent = z
+  .object({
+    source: z.enum(SKILL_SETUP_SOURCES).optional(),
+    query: z.string().min(1).max(200).optional(),
+    agentId: z.string().uuid().optional()
+  })
+  .strict()
+export type SkillSetupIntent = z.infer<typeof SkillSetupIntent>
+
+export const MCP_SETUP_URI = 'ui://agentconnect/mcp-setup'
+// A server's url, headers and OAuth credential are typed in the dialog, never carried in an intent.
+export const McpSetupIntent = z.object({ agentId: z.string().uuid().optional() }).strict()
+export type McpSetupIntent = z.infer<typeof McpSetupIntent>
+
+export const AGENT_TOOLS_URI = 'ui://agentconnect/agent-tools'
+// Which roster to show; omitted shows both, as the Console's Tools & Skills tab does.
+export const AGENT_TOOLS_FOCUS = ['mcp', 'skills'] as const
+export const AgentToolsIntent = z
+  .object({ agentId: z.string().uuid(), focus: z.enum(AGENT_TOOLS_FOCUS).optional() })
+  .strict()
+export type AgentToolsIntent = z.infer<typeof AgentToolsIntent>
+
+const nativeApp = <U extends string, I extends z.ZodTypeAny>(uri: U, intent: I) =>
+  z
+    .object({
+      resourceUri: z.literal(uri),
+      resourceVersion: z.literal(1),
+      orgId: z.string().min(1).max(200),
+      intent
+    })
+    .strict()
+
+// A bounded presentation request; Console JWT authorization governs every form read and write.
+export const NativeMcpUi = z.discriminatedUnion('resourceUri', [
+  nativeApp(INTEGRATION_SETUP_URI, IntegrationSetupIntent),
+  nativeApp(CODE_HOST_SETUP_URI, CodeHostSetupIntent),
+  nativeApp(AGENT_SETUP_URI, AgentSetupIntent),
+  nativeApp(SKILL_SETUP_URI, SkillSetupIntent),
+  nativeApp(MCP_SETUP_URI, McpSetupIntent),
+  nativeApp(AGENT_TOOLS_URI, AgentToolsIntent)
+])
+export type NativeMcpUi = z.infer<typeof NativeMcpUi>
+
+// A write tool's own answer stays its answer; the card it earns rides alongside it under this key.
+export const NativeUiEnvelope = z.object({ nativeUi: NativeMcpUi }).loose()
+
+/** The heading one intent earns, decided by the resource — the daemon's card chrome and the Console card must not word it differently. */
+export function nativeUiTitle(ui: NativeMcpUi): string {
+  switch (ui.resourceUri) {
+    case CODE_HOST_SETUP_URI:
+      return 'Code host connections'
+    case AGENT_SETUP_URI:
+      return ui.intent.draft ? 'Create agent' : ui.intent.created ? 'Agent created' : 'Edit agent'
+    case SKILL_SETUP_URI:
+      return 'Install skill'
+    case MCP_SETUP_URI:
+      return 'Add MCP server'
+    case AGENT_TOOLS_URI:
+      return ui.intent.focus === 'skills' ? 'Skills' : ui.intent.focus === 'mcp' ? 'MCP servers' : 'Tools & skills'
+    default:
+      return ui.intent.mode === 'edit' ? 'Edit integration' : 'Add integration'
+  }
+}
+
+// Sent as `protocolVersion` in the `ui/initialize` result; the official SDK's `App.connect()` rejects a result without it (SEP-1865 Final).
+export const MCP_APPS_PROTOCOL_VERSION = '2026-01-26'
+
+// The most text one `ui/message` may carry into the conversation; matches the wire field's bound so a decoded list is clamped before it is refused.
+export const MCP_APP_MESSAGE_MAX_CHARS = 4000
+
+// The most model context one app may hold via `ui/update-model-context`; a note for the next turn carried on the session, not a store.
+export const MCP_APP_CONTEXT_MAX_CHARS = 4000

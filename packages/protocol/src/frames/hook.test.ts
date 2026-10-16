@@ -1,0 +1,627 @@
+import { describe, expect, it } from 'vitest'
+import {
+  codeHostHookMetadataOf,
+  codeHostHookRevisionOf,
+  GiteaHookMetadata,
+  GithubHookMetadata,
+  GithubReviewAuthorize,
+  GitlabHookMetadata,
+  HookStart,
+  HOOK_REPORT_REASON_AGENT_HANDOVER,
+  HOOK_REPORT_REASON_SESSION_SOURCE_MISMATCH,
+  HOOK_REPORT_REASON_PROVIDER_AUTH_REQUIRED,
+  HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED,
+  HookConfigSnapshot,
+  HookReport,
+  buildEnvelope,
+  decodeEnvelope,
+  isGithubPullRequestRevisionEvent,
+  isFrame,
+  CODE_HOST_PROVIDERS,
+  CODE_HOST_ROUTING_PROVIDERS,
+  isCodeHostRoutingScope,
+  pickCodeHostHookMembers,
+  RdAck,
+  RdMsgHook
+} from '../index.js'
+
+const HOOK_ID = '11111111-1111-4111-8111-111111111111'
+const AGENT_ID = '22222222-2222-4222-8222-222222222222'
+const DAEMON_ID = '33333333-3333-4333-8333-333333333333'
+const ATTEMPT_ID = '44444444-4444-4444-8444-444444444444'
+
+const snapshot = {
+  configRevision: '7',
+  dispatchRevision: '9',
+  dispatchDaemonId: DAEMON_ID,
+  reviewPolicy: 'full' as const,
+  reportingMode: 'check' as const,
+  gateMode: 'informational' as const
+}
+
+const github = {
+  repoId: '987654321',
+  repoFullName: 'acme/infra',
+  sourceInstallationId: '1234567',
+  subjectKind: 'pull_request' as const,
+  pullNumber: 42,
+  headSha: 'a'.repeat(40),
+  baseSha: 'b'.repeat(40),
+  reportSha: 'a'.repeat(40),
+  headRepoFullName: 'alice/infra',
+  mergeCommitSha: 'c'.repeat(40),
+  isDraft: false,
+  baseChanged: false
+}
+
+const gitea = {
+  repoId: '556677',
+  repoPath: 'example-org/example-repo',
+  target: { kind: 'pull' as const, index: 42, headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40) }
+}
+
+describe('R1/R2a hook control schemas', () => {
+  it('requires an exact snapshot for action-time RPCs', () => {
+    expect(HookConfigSnapshot.safeParse(snapshot).success).toBe(true)
+    expect(HookConfigSnapshot.safeParse({ ...snapshot, dispatchRevision: undefined }).success).toBe(false)
+    expect(HookConfigSnapshot.safeParse({ ...snapshot, configRevision: '-1' }).success).toBe(false)
+  })
+
+  it('validates trusted PR metadata without requiring a webhook-provided revision', () => {
+    expect(GithubHookMetadata.safeParse(github).success).toBe(true)
+    expect(
+      GithubHookMetadata.safeParse({
+        ...github,
+        pullRequestReviewId: '3565283000',
+        reviewCommentId: '3565656411',
+        reviewThreadRootCommentId: '3565283658'
+      }).success
+    ).toBe(true)
+    // PR issue_comment: number is trusted, but the daemon resolves head/base later.
+    expect(
+      GithubHookMetadata.safeParse({
+        repoId: github.repoId,
+        repoFullName: github.repoFullName,
+        sourceInstallationId: github.sourceInstallationId,
+        subjectKind: 'pull_request',
+        pullNumber: 42,
+        explicitReviewRequest: true
+      }).success
+    ).toBe(true)
+    expect(GithubHookMetadata.safeParse({ ...github, pullNumber: undefined }).success).toBe(false)
+    expect(GithubHookMetadata.safeParse({ ...github, headSha: undefined }).success).toBe(false)
+    expect(GithubHookMetadata.safeParse({ ...github, reportSha: 'test-merge-sha' }).success).toBe(false)
+    expect(GithubHookMetadata.safeParse({ ...github, pullRequestReviewId: '0' }).success).toBe(false)
+    expect(GithubHookMetadata.safeParse({ ...github, reviewCommentId: '-1' }).success).toBe(false)
+    expect(GithubHookMetadata.safeParse({ ...github, reviewThreadRootCommentId: '01' }).success).toBe(false)
+  })
+
+  it('distinguishes target-branch changes from content-only PR edits', () => {
+    expect(isGithubPullRequestRevisionEvent('pull_request:opened')).toBe(true)
+    expect(isGithubPullRequestRevisionEvent('pull_request:synchronize')).toBe(true)
+    expect(isGithubPullRequestRevisionEvent('pull_request:edited', { baseChanged: true })).toBe(true)
+    expect(isGithubPullRequestRevisionEvent('pull_request:edited', { baseChanged: false })).toBe(false)
+  })
+
+  it('keeps legacy hook/report decodable while carrying submitted metadata for recovery', () => {
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-1',
+        status: 'success'
+      }).success
+    ).toBe(true)
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-2',
+        event: 'pull_request:synchronize',
+        github,
+        ...snapshot,
+        status: 'success',
+        publishedComment: { kind: 'issue_comment', commentId: '5199581711' }
+      }).success
+    ).toBe(true)
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-3',
+        status: 'success',
+        reviewAttemptId: ATTEMPT_ID,
+        reviewResult: {
+          state: 'submitted',
+          reviewId: '9007199254740993',
+          event: 'APPROVE',
+          verdict: 'pass',
+          commitId: github.headSha
+        },
+        publishedComment: { kind: 'issue_comment', commentId: '5199581711' }
+      }).success
+    ).toBe(false)
+    // An inline thread reply is not the top-level fallback: a verdict amendment rides beside it.
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-3',
+        status: 'success',
+        reviewAttemptId: ATTEMPT_ID,
+        reviewResult: {
+          state: 'submitted',
+          reviewId: '9007199254740993',
+          event: 'APPROVE',
+          verdict: 'pass',
+          commitId: github.headSha
+        },
+        publishedComment: { kind: 'review_comment', commentId: '5199581711' }
+      }).success
+    ).toBe(true)
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-1',
+        event: 'pull_request:synchronize',
+        github,
+        ...snapshot,
+        status: 'success',
+        reviewAttemptId: ATTEMPT_ID,
+        reviewResult: {
+          state: 'submitted',
+          reviewId: '9007199254740993',
+          event: 'APPROVE',
+          verdict: 'pass',
+          commitId: github.headSha
+        }
+      }).success
+    ).toBe(true)
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-1',
+        status: 'success',
+        reviewAttemptId: ATTEMPT_ID
+      }).success
+    ).toBe(false)
+  })
+
+  it('accepts the normalized provider quota failure reason', () => {
+    expect(HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED).toBe('provider_quota_exhausted')
+    expect(HOOK_REPORT_REASON_PROVIDER_AUTH_REQUIRED).toBe('provider_auth_required')
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-1',
+        status: 'failed',
+        reason: HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED
+      }).success
+    ).toBe(true)
+  })
+
+  it('accepts the normalized infrastructure-interruption reason', () => {
+    expect(HOOK_REPORT_REASON_AGENT_HANDOVER).toBe('agent_handover')
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-1',
+        status: 'failed',
+        sessionId: 'acp-1',
+        durationMs: 90_000,
+        reason: HOOK_REPORT_REASON_AGENT_HANDOVER
+      }).success
+    ).toBe(true)
+  })
+
+  it('accepts the normalized session-source-mismatch reason', () => {
+    expect(HOOK_REPORT_REASON_SESSION_SOURCE_MISMATCH).toBe('session_source_mismatch')
+    expect(
+      HookReport.safeParse({
+        hookId: HOOK_ID,
+        agentId: AGENT_ID,
+        deliveryKey: 'delivery-1',
+        status: 'failed',
+        reason: HOOK_REPORT_REASON_SESSION_SOURCE_MISMATCH
+      }).success
+    ).toBe(true)
+  })
+
+  it('round-trips hook/start and all formal-review correlated requests', () => {
+    const preparing = buildEnvelope('hook/preparing', {
+      hookId: HOOK_ID,
+      agentId: AGENT_ID,
+      deliveryKey: 'delivery-1',
+      ...snapshot
+    })
+    const decodedPreparing = decodeEnvelope(JSON.stringify(preparing))
+    expect(decodedPreparing.ok).toBe(true)
+    if (!decodedPreparing.ok || !isFrame('hook/preparing')(decodedPreparing.frame)) {
+      throw new Error('expected hook/preparing')
+    }
+    expect(decodedPreparing.frame.payload.dispatchRevision).toBe(snapshot.dispatchRevision)
+    expect(
+      decodeEnvelope(JSON.stringify(buildEnvelope('hook/preparing/ok', { accepted: true }, { corr: preparing.id }))).ok
+    ).toBe(true)
+
+    const start = buildEnvelope('hook/start', {
+      hookId: HOOK_ID,
+      agentId: AGENT_ID,
+      deliveryKey: 'delivery-1',
+      sessionId: 'session/with space',
+      event: 'pull_request:synchronize',
+      github,
+      ...snapshot
+    })
+    const decodedStart = decodeEnvelope(JSON.stringify(start))
+    expect(decodedStart.ok).toBe(true)
+    if (!decodedStart.ok || !isFrame('hook/start')(decodedStart.frame)) throw new Error('expected hook/start')
+    expect(decodedStart.frame.payload.sessionId).toBe('session/with space')
+    expect(decodedStart.frame.payload.github?.reportSha).toBe(github.headSha)
+
+    const startOk = decodeEnvelope(
+      JSON.stringify(buildEnvelope('hook/start/ok', { accepted: true }, { corr: start.id }))
+    )
+    expect(startOk.ok).toBe(true)
+    // A conversation turn's one review authority: the sealed verdict the CP names at the barrier.
+    const amendable = decodeEnvelope(
+      JSON.stringify(
+        buildEnvelope(
+          'hook/start/ok',
+          { accepted: true, amendment: { reportSha: github.headSha, event: 'REQUEST_CHANGES', verdict: 'fail' } },
+          { corr: start.id }
+        )
+      )
+    )
+    expect(amendable.ok).toBe(true)
+    if (!amendable.ok || !isFrame('hook/start/ok')(amendable.frame)) throw new Error('expected hook/start/ok')
+    expect(amendable.frame.payload.amendment).toEqual({
+      reportSha: github.headSha,
+      event: 'REQUEST_CHANGES',
+      verdict: 'fail'
+    })
+
+    const auth = buildEnvelope('github/review-authorize', {
+      hookId: HOOK_ID,
+      deliveryKey: 'delivery-1',
+      attemptId: ATTEMPT_ID,
+      requestedEvent: 'APPROVE',
+      requestedVerdict: 'pass',
+      snapshot
+    })
+    expect(decodeEnvelope(JSON.stringify(auth)).ok).toBe(true)
+    expect(
+      decodeEnvelope(
+        JSON.stringify(
+          buildEnvelope(
+            'github/review-authorized',
+            {
+              attemptId: ATTEMPT_ID,
+              token: 'ghs_secret',
+              ttlSec: 3600,
+              expiresAt: '2026-07-11T12:00:00.000Z',
+              repoId: github.repoId,
+              repoFullName: github.repoFullName,
+              pullNumber: github.pullNumber,
+              expectedHeadSha: github.headSha,
+              expectedBaseSha: github.baseSha
+            },
+            { corr: auth.id }
+          )
+        )
+      ).ok
+    ).toBe(true)
+
+    const result = buildEnvelope('github/review-result', {
+      hookId: HOOK_ID,
+      deliveryKey: 'delivery-1',
+      attemptId: ATTEMPT_ID,
+      snapshot,
+      result: {
+        state: 'submitted',
+        reviewId: '1234567890123456789',
+        event: 'APPROVE',
+        verdict: 'pass',
+        commitId: github.headSha
+      }
+    })
+    expect(decodeEnvelope(JSON.stringify(result)).ok).toBe(true)
+    expect(
+      decodeEnvelope(JSON.stringify(buildEnvelope('github/review-result/ok', { accepted: true }, { corr: result.id })))
+        .ok
+    ).toBe(true)
+  })
+
+  it('requires the requested verdict in the review authorization fence', () => {
+    const base = {
+      hookId: HOOK_ID,
+      deliveryKey: 'delivery-1',
+      attemptId: ATTEMPT_ID,
+      requestedEvent: 'COMMENT',
+      requestedVerdict: 'neutral',
+      snapshot
+    }
+    expect(GithubReviewAuthorize.safeParse(base).success).toBe(true)
+    expect(GithubReviewAuthorize.safeParse({ ...base, requestedVerdict: undefined }).success).toBe(false)
+  })
+})
+
+const gitlab = {
+  projectId: '4455667',
+  projectPath: 'example-group/sub/example-project',
+  webhookId: '9001',
+  target: { kind: 'merge_request' as const, iid: 7, headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40) }
+}
+
+describe('code-host M0 shapes (gitlab-com-integration.md §17.2)', () => {
+  it('validates GitLab subject metadata across all three targets', () => {
+    expect(GitlabHookMetadata.safeParse(gitlab).success).toBe(true)
+    expect(GitlabHookMetadata.safeParse({ ...gitlab, target: { kind: 'issue', iid: 12 } }).success).toBe(true)
+    expect(GitlabHookMetadata.safeParse({ ...gitlab, target: { kind: 'push', ref: 'refs/heads/main' } }).success).toBe(
+      true
+    )
+    // Missing subject identity is rejected before a session key could be derived from it.
+    expect(GitlabHookMetadata.safeParse({ ...gitlab, target: { kind: 'issue' } }).success).toBe(false)
+    expect(GitlabHookMetadata.safeParse({ ...gitlab, target: { kind: 'push', ref: '' } }).success).toBe(false)
+    expect(GitlabHookMetadata.safeParse({ ...gitlab, projectId: 'example/project' }).success).toBe(false)
+  })
+
+  it('keeps hook/start a provider one-of and existing github senders valid', () => {
+    const base = { hookId: HOOK_ID, agentId: AGENT_ID, deliveryKey: 'delivery-1', ...snapshot }
+    expect(HookStart.safeParse({ ...base, github }).success).toBe(true)
+    expect(HookStart.safeParse({ ...base, gitlab }).success).toBe(true)
+    expect(HookStart.safeParse(base).success).toBe(false)
+    expect(HookStart.safeParse({ ...base, github, gitlab }).success).toBe(false)
+  })
+
+  it('carries a review checkout outcome whose degraded arm names a closed reason', () => {
+    const base = { hookId: HOOK_ID, agentId: AGENT_ID, deliveryKey: 'delivery-1', github, ...snapshot }
+    expect(HookStart.safeParse({ ...base, reviewCheckout: { outcome: 'exact' } }).success).toBe(true)
+    expect(
+      HookStart.safeParse({ ...base, reviewCheckout: { outcome: 'degraded', reason: 'sandbox_conflict' } }).success
+    ).toBe(true)
+    expect(HookStart.safeParse({ ...base, reviewCheckout: { outcome: 'degraded' } }).success).toBe(false)
+    expect(HookStart.safeParse({ ...base, reviewCheckout: { outcome: 'degraded', reason: 'why not' } }).success).toBe(
+      false
+    )
+  })
+
+  it('round-trips a gitlab hook/start and its correlated barrier reply', () => {
+    const start = buildEnvelope('hook/start', {
+      hookId: HOOK_ID,
+      agentId: AGENT_ID,
+      deliveryKey: 'delivery-1',
+      sessionId: 'acp-gitlab-1',
+      event: 'merge_request:update',
+      gitlab,
+      ...snapshot
+    })
+    const decoded = decodeEnvelope(JSON.stringify(start))
+    expect(decoded.ok).toBe(true)
+    if (!decoded.ok || !isFrame('hook/start')(decoded.frame)) throw new Error('expected hook/start')
+    // The trusted subject discriminator survives the wire: the head the CP fences reviews on.
+    expect(decoded.frame.payload.github).toBeUndefined()
+    expect(decoded.frame.payload.gitlab?.projectId).toBe(gitlab.projectId)
+    const target = decoded.frame.payload.gitlab?.target
+    expect(target?.kind === 'merge_request' ? target.headSha : undefined).toBe('a'.repeat(40))
+    expect(
+      decodeEnvelope(JSON.stringify(buildEnvelope('hook/start/ok', { accepted: true }, { corr: start.id }))).ok
+    ).toBe(true)
+  })
+
+  it('accepts gitlab metadata and a provider-neutral published output on hook/report', () => {
+    const base = { hookId: HOOK_ID, agentId: AGENT_ID, deliveryKey: 'delivery-1', status: 'success' as const }
+    const note = { provider: 'gitlab', kind: 'note', externalId: '123456' }
+    expect(HookReport.safeParse({ ...base, gitlab, publishedOutput: note }).success).toBe(true)
+    // The provider members and the two published-output shapes are mutually exclusive.
+    expect(HookReport.safeParse({ ...base, github, gitlab }).success).toBe(false)
+    expect(
+      HookReport.safeParse({
+        ...base,
+        github,
+        publishedComment: { kind: 'issue_comment', commentId: '77' },
+        publishedOutput: note
+      }).success
+    ).toBe(false)
+    // A submitted formal review still excludes any fallback output.
+    expect(
+      HookReport.safeParse({
+        ...base,
+        gitlab,
+        reviewAttemptId: ATTEMPT_ID,
+        reviewResult: { state: 'submitted', reviewId: 'r1', event: 'COMMENT', verdict: 'pass', commitId: 'c1' },
+        publishedOutput: note
+      }).success
+    ).toBe(false)
+  })
+})
+
+describe('gitea shapes (gitea-integration.md §8, §11)', () => {
+  it('validates Gitea subject metadata across all three targets', () => {
+    expect(GiteaHookMetadata.safeParse(gitea).success).toBe(true)
+    expect(GiteaHookMetadata.safeParse({ ...gitea, target: { kind: 'issue', index: 12 } }).success).toBe(true)
+    expect(GiteaHookMetadata.safeParse({ ...gitea, target: { kind: 'push', ref: 'refs/heads/main' } }).success).toBe(
+      true
+    )
+    // Issues and pull requests share one index space, so BOTH discriminators are legal and neither
+    // may be omitted — a key built without the kind would fuse issue 7 with pull request 7.
+    expect(GiteaHookMetadata.safeParse({ ...gitea, target: { kind: 'merge_request', index: 7 } }).success).toBe(false)
+    // Missing subject identity is rejected before a session key could be derived from it.
+    expect(GiteaHookMetadata.safeParse({ ...gitea, target: { kind: 'issue' } }).success).toBe(false)
+    expect(GiteaHookMetadata.safeParse({ ...gitea, target: { kind: 'push', ref: '' } }).success).toBe(false)
+    expect(GiteaHookMetadata.safeParse({ ...gitea, repoId: 'example-org/example-repo' }).success).toBe(false)
+    // The instance fence and the acknowledgement target are optional; absent means gitea.com and
+    // "the subject itself fired this delivery".
+    expect(GiteaHookMetadata.safeParse({ ...gitea, host: 'https://gitea.example.test', commentId: '9' }).success).toBe(
+      true
+    )
+  })
+
+  it('keeps hook/start and hook/report a provider one-of with the third member', () => {
+    const base = { hookId: HOOK_ID, agentId: AGENT_ID, deliveryKey: 'delivery-1', ...snapshot }
+    expect(HookStart.safeParse({ ...base, gitea }).success).toBe(true)
+    expect(HookStart.safeParse({ ...base, gitea, github }).success).toBe(false)
+    expect(HookStart.safeParse({ ...base, gitea, gitlab }).success).toBe(false)
+    const report = { hookId: HOOK_ID, agentId: AGENT_ID, deliveryKey: 'delivery-1', status: 'success' as const }
+    expect(HookReport.safeParse({ ...report, gitea }).success).toBe(true)
+    expect(HookReport.safeParse({ ...report, gitea, gitlab }).success).toBe(false)
+  })
+
+  it('round-trips a gitea member over the wire for a peer that negotiated the slice', () => {
+    const start = buildEnvelope('hook/start', {
+      hookId: HOOK_ID,
+      agentId: AGENT_ID,
+      deliveryKey: 'delivery-1',
+      event: 'merge_request:synchronize',
+      gitea,
+      ...snapshot
+    })
+    const decoded = decodeEnvelope(JSON.stringify(start))
+    if (!decoded.ok || !isFrame('hook/start')(decoded.frame)) throw new Error('expected hook/start')
+    expect(decoded.frame.payload.github).toBeUndefined()
+    expect(decoded.frame.payload.gitlab).toBeUndefined()
+    expect(decoded.frame.payload.gitea?.repoId).toBe(gitea.repoId)
+  })
+})
+
+describe('code-host member view (gitea-integration.md §13)', () => {
+  it('derives one provider-keyed view from the wire members and keys it by repository', () => {
+    expect(codeHostHookMetadataOf({ github })).toEqual({
+      provider: 'github',
+      repo: { provider: 'github', externalId: github.repoId, path: github.repoFullName },
+      metadata: github
+    })
+    expect(codeHostHookMetadataOf({ gitlab })).toEqual({
+      provider: 'gitlab',
+      repo: { provider: 'gitlab', externalId: gitlab.projectId, path: gitlab.projectPath },
+      metadata: gitlab
+    })
+    expect(codeHostHookMetadataOf({ gitea })).toEqual({
+      provider: 'gitea',
+      repo: { provider: 'gitea', externalId: gitea.repoId, path: gitea.repoPath },
+      metadata: gitea
+    })
+  })
+
+  it('fails closed on a frame carrying no member or (malformed) more than one', () => {
+    expect(codeHostHookMetadataOf({})).toBeUndefined()
+    expect(codeHostHookMetadataOf({ github, gitlab })).toBeUndefined()
+    expect(codeHostHookMetadataOf({ github, gitea })).toBeUndefined()
+    expect(codeHostHookMetadataOf({ gitlab, gitea })).toBeUndefined()
+  })
+
+  it('reads the member a decoded frame kept for an older peer', () => {
+    const decoded = HookReport.parse({
+      hookId: HOOK_ID,
+      agentId: AGENT_ID,
+      deliveryKey: 'delivery-1',
+      status: 'success',
+      gitlab
+    })
+    expect(decoded.gitlab).toEqual(gitlab)
+    expect(codeHostHookMetadataOf(decoded)?.provider).toBe('gitlab')
+  })
+
+  it('reads the pull/merge-request revision off each member and none off an issue or a push', () => {
+    expect(codeHostHookRevisionOf(codeHostHookMetadataOf({ github })!)).toEqual({
+      headSha: github.headSha,
+      baseSha: github.baseSha
+    })
+    expect(codeHostHookRevisionOf(codeHostHookMetadataOf({ gitlab })!)).toEqual({
+      headSha: gitlab.target.headSha,
+      baseSha: gitlab.target.baseSha
+    })
+    expect(codeHostHookRevisionOf(codeHostHookMetadataOf({ gitea })!)).toEqual({
+      headSha: gitea.target.headSha,
+      baseSha: gitea.target.baseSha
+    })
+    const issue = { ...gitea, target: { kind: 'issue' as const, index: 7 } }
+    expect(codeHostHookRevisionOf(codeHostHookMetadataOf({ gitea: issue })!)).toBeUndefined()
+    const push = { ...gitlab, target: { kind: 'push' as const, ref: 'refs/heads/main' } }
+    expect(codeHostHookRevisionOf(codeHostHookMetadataOf({ gitlab: push })!)).toBeUndefined()
+    const headless = { ...gitea, target: { kind: 'pull' as const, index: 42 } }
+    expect(codeHostHookRevisionOf(codeHostHookMetadataOf({ gitea: headless })!)).toBeUndefined()
+  })
+
+  it('copies the members forward as they are for a frame that only forwards them', () => {
+    expect(pickCodeHostHookMembers({ github })).toEqual({ github })
+    expect(pickCodeHostHookMembers({ gitlab, github: undefined })).toEqual({ gitlab })
+    expect(pickCodeHostHookMembers({ gitea })).toEqual({ gitea })
+    expect(pickCodeHostHookMembers({})).toEqual({})
+  })
+})
+
+describe('code-host Decision routing shapes (code-host-decisions.md §3-§5)', () => {
+  const ROUTING_ID = '55555555-5555-4555-8555-555555555555'
+  const DECISION_ID = '66666666-6666-4666-8666-666666666666'
+  const fire = {
+    source: 'hook',
+    agentId: AGENT_ID,
+    sessionKey: 'github:1#42',
+    msgId: `${HOOK_ID}:delivery-1`,
+    hookId: HOOK_ID,
+    deliveryKey: 'delivery-1',
+    firedAt: '2026-01-01T00:00:00.000Z'
+  }
+
+  it('carries the host copy, its candidates, and the subject on a routed event', () => {
+    const msg = RdMsgHook.parse({
+      ...fire,
+      routing: {
+        routingId: ROUTING_ID,
+        decisionId: DECISION_ID,
+        candidates: [{ hookId: HOOK_ID, agentId: AGENT_ID }]
+      },
+      context: { source: 'github', subject: { authorLogin: 'octo', state: 'open', draft: false, body: 'Steps' } }
+    })
+    expect(msg.routing?.candidates).toHaveLength(1)
+    expect(msg.context?.subject?.authorLogin).toBe('octo')
+  })
+
+  it('carries why a routed fire was selected', () => {
+    const msg = RdMsgHook.parse({
+      ...fire,
+      routeSelection: {
+        routingId: ROUTING_ID,
+        decisionId: DECISION_ID,
+        reason: 'decision',
+        verdictSeq: 7,
+        answer: { type: 'boolean', value: true, probability: 0.9 },
+        matchedKeys: ['true']
+      }
+    })
+    expect(msg.routeSelection?.reason).toBe('decision')
+  })
+
+  it('still decodes a fire without either', () => {
+    const msg = RdMsgHook.parse(fire)
+    expect(msg.routing).toBeUndefined()
+    expect(msg.routeSelection).toBeUndefined()
+  })
+
+  it('returns the host verdict on the ack', () => {
+    const ack = RdAck.parse({
+      msgId: fire.msgId,
+      accepted: true,
+      hookRoute: {
+        targets: [
+          { hookId: HOOK_ID, selection: { routingId: ROUTING_ID, decisionId: DECISION_ID, reason: 'otherwise' } }
+        ]
+      }
+    })
+    expect(ack.hookRoute?.targets[0]?.hookId).toBe(HOOK_ID)
+  })
+})
+
+describe('code-host routing scopes', () => {
+  it('lists every code-host provider, each with its own routable families', () => {
+    expect([...CODE_HOST_ROUTING_PROVIDERS].sort()).toEqual([...CODE_HOST_PROVIDERS].sort())
+    expect(isCodeHostRoutingScope('gitlab', 'merge_request')).toBe(true)
+    expect(isCodeHostRoutingScope('github', 'merge_request')).toBe(false)
+    expect(isCodeHostRoutingScope('gitea', 'pull_request')).toBe(false)
+  })
+})

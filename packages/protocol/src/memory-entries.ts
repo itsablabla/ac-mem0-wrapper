@@ -1,0 +1,206 @@
+import { z } from 'zod'
+
+export const MEMORY_ENTRIES_VERSION = 1 as const
+export const MEMORY_ENTRY_FRAME_BYTES = 64 * 1024
+export const MEMORY_ENTRY_REF_MAX_LENGTH = 4096
+export const MemoryEntryRef = z.string().min(1).max(MEMORY_ENTRY_REF_MAX_LENGTH)
+export const MemoryEntryCursor = z.string().min(1).max(2048)
+export const MemoryEntryOperation = z.enum(['list', 'get', 'search', 'create', 'update', 'delete', 'history'])
+export const MemoryEntryCapabilities = z
+  .object({
+    version: z.literal(MEMORY_ENTRIES_VERSION),
+    operations: z.array(MemoryEntryOperation),
+    searchKind: z.enum(['lexical', 'semantic', 'hybrid']).optional(),
+    supportedScopes: z.array(z.enum(['agent', 'channel'])),
+    writeConsistency: z.enum(['conditional', 'last-write-wins']),
+    exactEdit: z.boolean(),
+    exactCreate: z.boolean(),
+    enumeration: z.enum(['snapshot', 'live', 'unavailable']),
+    graph: z.boolean(),
+    limits: z.object({
+      maxMutationRequestBytes: z.number().int().positive().optional(),
+      maxItemBytes: z.number().int().positive(),
+      maxPageItems: z.number().int().min(1).max(100)
+    })
+  })
+  .strict()
+export type MemoryEntryCapabilities = z.infer<typeof MemoryEntryCapabilities>
+
+export const MemoryEntrySummary = z
+  .object({
+    ref: MemoryEntryRef,
+    label: z.string().max(512),
+    description: z.string().max(1024).optional(),
+    format: z.enum(['markdown', 'text']),
+    byteSize: z.number().int().nonnegative(),
+    createdAt: z.string().optional(),
+    updatedAt: z.string().optional(),
+    revision: z.string().max(512).optional(),
+    origin: z.enum(['active', 'inherited']),
+    editable: z.boolean()
+  })
+  .strict()
+export type MemoryEntrySummary = z.infer<typeof MemoryEntrySummary>
+
+export const MemoryEntryListRequest = z
+  .object({
+    cursor: MemoryEntryCursor.optional(),
+    limit: z.number().int().min(1).max(100).default(20)
+  })
+  .strict()
+export type MemoryEntryListRequest = z.infer<typeof MemoryEntryListRequest>
+export const MemoryEntryListResult = z
+  .object({
+    entries: z.array(MemoryEntrySummary).max(100),
+    nextCursor: MemoryEntryCursor.optional(),
+    consistency: z.enum(['snapshot', 'live']),
+    order: z.enum(['topic', 'backend']),
+    catalogRevision: z.string().max(512).optional()
+  })
+  .strict()
+export type MemoryEntryListResult = z.infer<typeof MemoryEntryListResult>
+
+export const MemoryEntryGetRequest = z
+  .object({
+    ref: MemoryEntryRef,
+    cursor: MemoryEntryCursor.optional(),
+    maxBytes: z
+      .number()
+      .int()
+      .min(4)
+      .max(32 * 1024)
+      .default(32 * 1024)
+  })
+  .strict()
+export type MemoryEntryGetRequest = z.infer<typeof MemoryEntryGetRequest>
+export const MemoryEntryLink = z
+  .object({ label: z.string().max(512), ref: MemoryEntryRef.optional(), exists: z.boolean() })
+  .strict()
+export type MemoryEntryLink = z.infer<typeof MemoryEntryLink>
+export const MemoryEntryContent = z
+  .object({
+    entry: MemoryEntrySummary,
+    text: z.string(),
+    complete: z.boolean(),
+    nextContentCursor: MemoryEntryCursor.optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    links: z.array(MemoryEntryLink).max(20).optional(),
+    backlinks: z.array(MemoryEntryLink).max(20).optional()
+  })
+  .strict()
+export type MemoryEntryContent = z.infer<typeof MemoryEntryContent>
+
+export const MemoryEntrySearchRequest = z
+  .object({ query: z.string().min(1).max(2048), limit: z.number().int().min(1).max(20).default(5) })
+  .strict()
+export type MemoryEntrySearchRequest = z.infer<typeof MemoryEntrySearchRequest>
+export const MemoryEntrySearchHit = z.object({ entry: MemoryEntrySummary, snippet: z.string().max(1024) }).strict()
+export type MemoryEntrySearchHit = z.infer<typeof MemoryEntrySearchHit>
+// Search is retrieval, never enumeration: the kind and coverage say what the hits can and cannot prove.
+export const MemoryEntrySearchResult = z
+  .object({
+    hits: z.array(MemoryEntrySearchHit).max(20),
+    kind: z.enum(['lexical', 'semantic', 'hybrid', 'unknown']),
+    coverage: z.enum(['complete', 'partial', 'unknown'])
+  })
+  .strict()
+export type MemoryEntrySearchResult = z.infer<typeof MemoryEntrySearchResult>
+
+export const MemoryEntryHistoryRequest = z
+  .object({
+    ref: MemoryEntryRef,
+    cursor: MemoryEntryCursor.optional(),
+    limit: z.number().int().min(1).max(5).default(5)
+  })
+  .strict()
+export type MemoryEntryHistoryRequest = z.infer<typeof MemoryEntryHistoryRequest>
+// A console-side audit view: what changed, by whom, with bounded snapshots; never model-readable authority.
+export const MemoryEntryHistoryEvent = z
+  .object({
+    id: z.string().max(512).optional(),
+    kind: z.enum(['create', 'update', 'delete']),
+    at: z.string().optional(),
+    source: z.enum(['tool', 'console', 'distill', 'dream']).optional(),
+    before: z.string().max(4001).optional(),
+    after: z.string().max(4001).optional(),
+    truncated: z.boolean().optional()
+  })
+  .strict()
+export type MemoryEntryHistoryEvent = z.infer<typeof MemoryEntryHistoryEvent>
+export const MemoryEntryHistoryResult = z
+  .object({
+    events: z.array(MemoryEntryHistoryEvent).max(5),
+    nextCursor: MemoryEntryCursor.optional(),
+    order: z.enum(['newest-first', 'backend'])
+  })
+  .strict()
+export type MemoryEntryHistoryResult = z.infer<typeof MemoryEntryHistoryResult>
+
+export const MemoryContextRequest = z
+  .object({
+    seenRevision: z.string().max(512).optional(),
+    maxBytes: z
+      .number()
+      .int()
+      .min(4)
+      .max(32 * 1024)
+      .default(25_000)
+  })
+  .strict()
+export type MemoryContextRequest = z.infer<typeof MemoryContextRequest>
+export const MemoryContextResult = z
+  .object({
+    catalogRevision: z.string().max(512).optional(),
+    freshness: z.enum(['current', 'cached', 'unknown']),
+    coverage: z.enum(['complete', 'partial', 'unavailable']),
+    overview: z.string()
+  })
+  .strict()
+export type MemoryContextResult = z.infer<typeof MemoryContextResult>
+
+export const MemoryEntryErrorCode = z.enum([
+  'UNSUPPORTED',
+  'FORBIDDEN',
+  'NOT_FOUND',
+  'INVALID_ARGUMENT',
+  'CONFLICT',
+  'STALE_BINDING',
+  'CURSOR_EXPIRED',
+  'TOO_LARGE',
+  'UNAVAILABLE',
+  'AMBIGUOUS_WRITE'
+])
+export type MemoryEntryErrorCode = z.infer<typeof MemoryEntryErrorCode>
+
+const mutationText = z.string().max(256_000)
+const mutationMetadata = z.record(z.string(), z.unknown()).optional()
+export const MemoryEntryCreateRequest = z
+  .object({ label: z.string().min(1).max(512).optional(), text: mutationText, metadata: mutationMetadata })
+  .strict()
+export type MemoryEntryCreateRequest = z.infer<typeof MemoryEntryCreateRequest>
+const updateTarget = {
+  ref: MemoryEntryRef,
+  revision: z.string().min(1).max(512).optional(),
+  metadata: mutationMetadata
+}
+export const MemoryEntryUpdateRequest = z.union([
+  z.object({ ...updateTarget, text: mutationText }).strict(),
+  z
+    .object({ ...updateTarget, edit: z.object({ oldText: mutationText.min(1), newText: mutationText }).strict() })
+    .strict()
+])
+export type MemoryEntryUpdateRequest = z.infer<typeof MemoryEntryUpdateRequest>
+export const MemoryEntryDeleteRequest = z
+  .object({ ref: MemoryEntryRef, revision: z.string().min(1).max(512).optional() })
+  .strict()
+export type MemoryEntryDeleteRequest = z.infer<typeof MemoryEntryDeleteRequest>
+export const MemoryEntryMutationReceipt = z
+  .object({
+    operationId: z.string().uuid(),
+    state: z.literal('completed'),
+    entry: MemoryEntrySummary.optional(),
+    deletedRef: MemoryEntryRef.optional(),
+    catalogRevision: z.string().max(512).optional()
+  })
+  .strict()
+export type MemoryEntryMutationReceipt = z.infer<typeof MemoryEntryMutationReceipt>

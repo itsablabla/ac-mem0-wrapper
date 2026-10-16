@@ -1,0 +1,60 @@
+{
+  "name": "@agentconnect.md/observability",
+  "version": "2.0.0-dev",
+  "description": "AgentConnect shared OpenTelemetry bootstrap and span-name hygiene for the Node services",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "development": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "pnpm --filter \"{.}...\" build:package",
+    "build:package": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "prepack": "pnpm run build",
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "typecheck": "tsc -p tsconfig.typecheck.json"
+  },
+  "sideEffects": false,
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@fastify/otel": "^0.21.1",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/instrumentation": "^0.222.0",
+    "@opentelemetry/instrumentation-http": "^0.222.0",
+    "@opentelemetry/instrumentation-undici": "^0.32.0",
+    "@opentelemetry/resources": "^2.11.0",
+    "@opentelemetry/sdk-node": "^0.222.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.1",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.3"
+  },
+  "keywords": [
+    "agentconnect",
+    "observability",
+    "opentelemetry",
+    "tracing"
+  ],
+  "engines": {
+    "node": ">=24.12.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
